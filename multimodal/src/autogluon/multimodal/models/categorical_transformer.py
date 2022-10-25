@@ -110,6 +110,9 @@ class CategoricalTransformer(nn.Module):
         head_normalization: Optional[str] = "layer_norm",
         additive_attention: Optional[bool] = False,
         share_qv_weights: Optional[bool] = False,
+        row_attention: Optional[bool] = False,
+        row_attention_layer: Optional[str] = None,
+        global_token: Optional[bool] = False,
     ) -> None:
         """
         Parameters
@@ -182,7 +185,7 @@ class CategoricalTransformer(nn.Module):
         assert token_initialization in ["uniform", "normal"], "initialization must be uniform or normal"
 
         self.num_categories = num_categories
-
+        self.row_attention = row_attention
         self.prefix = prefix
         self.out_features = out_features
 
@@ -234,6 +237,9 @@ class CategoricalTransformer(nn.Module):
             d_out=out_features,
             additive_attention=additive_attention,
             share_qv_weights=share_qv_weights,
+            row_attention=row_attention,
+            row_attention_layer=row_attention_layer,
+            global_token=global_token,
         )
 
         self.head = FT_Transformer.Head(

@@ -473,14 +473,90 @@ class FT_Transformer(nn.Module):
             super().__init__()
             self.normalization = _make_nn_module(normalization, d_in)
             self.activation = _make_nn_module(activation)
-            self.linear = nn.Linear(d_in, d_out, bias)
+            self.linear_first = nn.Linear(d_in, d_in, bias)
+            self.linear_second = nn.Linear(d_in, d_out, bias)
 
         def forward(self, x: Tensor) -> Tensor:
             x = x[:, -1]
+            x = self.linear_first(x)
             x = self.normalization(x)
             x = self.activation(x)
-            x = self.linear(x)
+            x = self.linear_second(x)
             return x
+
+    class ContrastiveHead(nn.Module):
+        """The final module of the `Transformer` that performs BERT-like inference."""
+
+        def __init__(
+            self,
+            *,
+            d_in: int,
+            bias: bool,
+            activation: ModuleType,
+            normalization: ModuleType,
+            d_out: int,
+        ):
+            super().__init__()
+            self.normalization = _make_nn_module(normalization, d_in)
+            self.activation = _make_nn_module(activation)
+            self.linear1 = nn.Linear(d_in, d_in, bias)
+            self.linear2 = nn.Linear(d_in, d_out, bias)
+
+        def forward(self, x: Tensor) -> Tensor:
+            x = x[:, :-1]
+            x = self.linear1(x)
+            x = self.normalization(x)
+            x = self.activation(x)
+            x = self.linear2(x)
+            return x
+
+    class ReconstructionHead(nn.Module):
+        """The final module of the `Transformer` that performs BERT-like inference."""
+
+        def __init__(
+            self,
+            *,
+            d_in: int,
+            bias: bool,
+            activation: ModuleType,
+            normalization: ModuleType,
+            n_num_features: Optional[int] = 0,
+            category_sizes: Optional[List[int]] = None,
+        ):
+            super().__init__()
+            self.normalization = _make_nn_module(normalization, d_in)
+            self.activation = _make_nn_module(activation)
+            self.linear = nn.Linear(d_in, d_in, bias)
+
+            self.num_out = nn.ModuleList([nn.Linear(d_in, 1) for _ in range(n_num_features)])
+
+            if category_sizes:
+                self.cat_out = nn.ModuleList([nn.Linear(d_in, o) for o in category_sizes])
+            else:
+                self.cat_out = None
+            self.category_sizes = category_sizes
+
+        def forward(self, x: Tensor):
+            x = x[:, :-1]
+            x = self.linear(x)
+            x = self.normalization(x)
+            x = self.activation(x)
+
+            if self.cat_out:
+                x_cat = x[:, : len(self.category_sizes), :]
+                cat_out = [f(x_cat[:, i]) for i, f in enumerate(self.cat_out)]
+            else:
+                cat_out = None
+
+            x_num = x
+            if self.category_sizes:
+                x_num = x[:, len(self.category_sizes) :, :]
+            num_out = [f(x_num[:, i]) for i, f in enumerate(self.num_out)]
+            if len(num_out)>0:
+                num_out = torch.concat(num_out, dim=1)
+            else:
+                num_out = None
+            return {"num_out": num_out, "cat_out": cat_out}
 
     def __init__(
         self,
@@ -508,6 +584,9 @@ class FT_Transformer(nn.Module):
         projection: Optional[bool] = False,
         additive_attention: Optional[bool] = False,
         share_qv_weights: Optional[bool] = False,
+        row_attention: Optional[bool] = False,
+        row_attention_layer: Optional[str] = None,
+        global_token: Optional[bool] = False,
     ) -> None:
         """
         Parameters
@@ -556,6 +635,10 @@ class FT_Transformer(nn.Module):
             if 'true', then value and query transformation parameters are shared in additive attention.
         """
         super().__init__()
+        if row_attention:
+            row_attention_layer = row_attention_layer if row_attention_layer else "last"
+        else:
+            row_attention_layer = None
         if isinstance(last_layer_query_idx, int):
             raise ValueError(
                 "last_layer_query_idx must be None, list[int] or slice. "
@@ -606,8 +689,37 @@ class FT_Transformer(nn.Module):
 
         self.prenormalization = prenormalization
         self.last_layer_query_idx = last_layer_query_idx
+        self.row_attention = row_attention
+        self.row_attention_layer = row_attention_layer
+        self.global_token = global_token
 
         self.blocks = nn.ModuleList([])
+        if self.row_attention:
+            self.row_attention_layers = nn.ModuleDict(
+                {
+                    "row_attention": MultiheadAttention(
+                        d_token=d_token,
+                        n_heads=attention_n_heads,
+                        dropout=attention_dropout,
+                        bias=True,
+                        initialization=attention_initialization,
+                    ),
+                    "row_ffn": FT_Transformer.FFN(
+                        d_token=d_token,
+                        d_hidden=ffn_d_hidden,
+                        bias_first=True,
+                        bias_second=True,
+                        dropout=ffn_dropout,
+                        activation=ffn_activation,
+                    ),
+                    "row_attention_residual_dropout": nn.Dropout(residual_dropout),
+                    "row_ffn_residual_dropout": nn.Dropout(residual_dropout),
+                    "row_output": nn.Identity(),  # for hooks-based introspection
+                }
+            )
+            # for p in self.row_attention_layers.parameters():
+            #     nn.init.zeros_(p)
+
         for layer_idx in range(n_blocks):
             layer = nn.ModuleDict(
                 {
@@ -649,6 +761,32 @@ class FT_Transformer(nn.Module):
                     layer["value_compression"] = make_kv_compression()
                 else:
                     assert kv_compression_sharing == "key-value", _INTERNAL_ERROR_MESSAGE
+            if row_attention:
+                self.row_attention_layers = nn.ModuleDict(
+                    {
+                        "row_attention": MultiheadAttention(
+                            d_token=d_token,
+                            n_heads=attention_n_heads,
+                            dropout=attention_dropout,
+                            bias=True,
+                            initialization=attention_initialization,
+                        ),
+                        "row_ffn": FT_Transformer.FFN(
+                            d_token=d_token,
+                            d_hidden=ffn_d_hidden,
+                            bias_first=True,
+                            bias_second=True,
+                            dropout=ffn_dropout,
+                            activation=ffn_activation,
+                        ),
+                        "row_attention_residual_dropout": nn.Dropout(residual_dropout),
+                        "row_ffn_residual_dropout": nn.Dropout(residual_dropout),
+                        "row_output": nn.Identity(),  # for hooks-based introspection
+                    }
+                )
+                # for p in self.row_attention_layers.parameters():
+                #     nn.init.zeros_(p)
+                layer.update(self.row_attention_layers)
             self.blocks.append(layer)
 
         self.head = (
@@ -675,7 +813,10 @@ class FT_Transformer(nn.Module):
         )
 
     def _start_residual(self, layer, stage, x):
-        assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
+        if not self.row_attention:
+            assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
+        else:
+            assert stage in ["attention", "ffn", "row_attention", "row_ffn"], _INTERNAL_ERROR_MESSAGE
         x_residual = x
         if self.prenormalization:
             norm_key = f"{stage}_normalization"
@@ -684,19 +825,56 @@ class FT_Transformer(nn.Module):
         return x_residual
 
     def _end_residual(self, layer, stage, x, x_residual):
-        assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
+        if not self.row_attention:
+            assert stage in ["attention", "ffn"], _INTERNAL_ERROR_MESSAGE
+        else:
+            assert stage in ["attention", "ffn", "row_attention", "row_ffn"], _INTERNAL_ERROR_MESSAGE
         x_residual = layer[f"{stage}_residual_dropout"](x_residual)
         x = x + x_residual
         if not self.prenormalization:
             x = layer[f"{stage}_normalization"](x)
         return x
 
+    def _start_global_token(self, x):
+        if self.global_token:
+            x = torch.concat(
+                [torch.mean(x, dim=1).unsqueeze(1), x],
+                dim=1,
+            )
+        return x
+
+    def _end_global_token(self, x):
+        if self.global_token:
+            x = x[:, 1:]
+        return x
+
     def forward(self, x: Tensor) -> Tensor:
         assert x.ndim == 3, "The input must have 3 dimensions: (n_objects, n_tokens, d_token)"
         for layer_idx, layer in enumerate(self.blocks):
+
             layer = cast(nn.ModuleDict, layer)
 
+            if self.row_attention_layer == "first" and layer_idx == 0:
+                x = torch.transpose(x, 0, 1)
+                x = self._start_global_token(x)
+                x_residual = self._start_residual(layer, "row_attention", x)
+                x_residual, _ = layer["row_attention"](
+                    x_residual,
+                    x_residual,
+                    None,
+                    None,
+                )
+                x = self._end_residual(layer, "row_attention", x, x_residual)
+                x_residual = self._start_residual(layer, "row_ffn", x)
+                x_residual = layer["row_ffn"](x_residual)
+                x = self._end_residual(layer, "row_ffn", x, x_residual)
+                x = layer["row_output"](x)
+                x = self._end_global_token(x)
+                x = torch.transpose(x, 0, 1)
+
             query_idx = self.last_layer_query_idx if layer_idx + 1 == len(self.blocks) else None
+
+            x = self._start_global_token(x)
             x_residual = self._start_residual(layer, "attention", x)
             x_residual, _ = layer["attention"](
                 x_residual if query_idx is None else x_residual[:, query_idx],
@@ -711,6 +889,27 @@ class FT_Transformer(nn.Module):
             x_residual = layer["ffn"](x_residual)
             x = self._end_residual(layer, "ffn", x, x_residual)
             x = layer["output"](x)
+            x = self._end_global_token(x)
+
+            if self.row_attention_layer == "shared" or (
+                self.row_attention_layer == "last" and layer_idx + 1 == len(self.blocks)
+            ):
+                x = torch.transpose(x, 0, 1)
+                x = self._start_global_token(x)
+                x_residual = self._start_residual(layer, "row_attention", x)
+                x_residual, _ = layer["row_attention"](
+                    x_residual,
+                    x_residual,
+                    None,
+                    None,
+                )
+                x = self._end_residual(layer, "row_attention", x, x_residual)
+                x_residual = self._start_residual(layer, "row_ffn", x)
+                x_residual = layer["row_ffn"](x_residual)
+                x = self._end_residual(layer, "row_ffn", x, x_residual)
+                x = layer["row_output"](x)
+                x = self._end_global_token(x)
+                x = torch.transpose(x, 0, 1)
 
         x = self.head(x)
 

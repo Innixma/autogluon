@@ -1,3 +1,4 @@
+import copy
 import functools
 import logging
 import re
@@ -472,6 +473,7 @@ def apply_single_lr(
     model: nn.Module,
     lr: float,
     weight_decay: float,
+    row_attention_weight_decay: float,
     return_params: Optional[bool] = True,
 ):
     """
@@ -496,15 +498,32 @@ def apply_single_lr(
     -------
     The grouped parameters or their names.
     """
+    if row_attention_weight_decay is None:
+        row_attention_weight_decay = weight_decay
+    else:
+        row_attention_weight_decay = row_attention_weight_decay / lr
     decay_param_names = get_weight_decay_param_names(model)
     optimizer_grouped_parameters = [
         {
-            "params": [p if return_params else n for n, p in model.named_parameters() if n in decay_param_names],
+            "params": [
+                p if return_params else n
+                for n, p in model.named_parameters()
+                if (n in decay_param_names) # and "row" not in n)
+            ],
             "weight_decay": weight_decay,
             "lr": lr,
         },
+        # {
+        #     "params": [p if return_params else n for n, p in model.named_parameters() if ("row" in n)],
+        #     "weight_decay": row_attention_weight_decay,
+        #     "lr": lr,
+        # },
         {
-            "params": [p if return_params else n for n, p in model.named_parameters() if n not in decay_param_names],
+            "params": [
+                p if return_params else n
+                for n, p in model.named_parameters()
+                if (n not in decay_param_names) # and "row" not in n)
+            ],
             "weight_decay": 0.0,
             "lr": lr,
         },

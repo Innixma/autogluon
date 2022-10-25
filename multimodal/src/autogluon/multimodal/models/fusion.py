@@ -245,6 +245,12 @@ class MultimodalFusionTransformer(nn.Module):
         loss_weight: Optional[float] = None,
         additive_attention: Optional[bool] = False,
         share_qv_weights: Optional[bool] = False,
+        row_attention: Optional[bool] = False,
+        row_attention_layer: Optional[str] = None,
+        global_token: Optional[bool] = False,
+        num_numerical_columns: Optional[int] = None,
+        num_categories: Optional[List[int]] = None,
+        pretrain_objective: Optional[str] = "both",
     ):
         """
         Parameters
@@ -315,6 +321,12 @@ class MultimodalFusionTransformer(nn.Module):
 
         self.loss_weight = loss_weight
         self.model = nn.ModuleList(models)
+        self.row_attention = row_attention
+        if share_qv_weights:
+            self.pretrain_cls = True
+            share_qv_weights = False
+        else:
+            self.pretrain_cls = False
 
         raw_in_features = [per_model.out_features for per_model in models]
 
@@ -355,26 +367,89 @@ class MultimodalFusionTransformer(nn.Module):
             projection=False,
             additive_attention=additive_attention,
             share_qv_weights=share_qv_weights,
+            row_attention=row_attention,
+            row_attention_layer=row_attention_layer,
+            global_token=global_token,
         )
 
-        self.head = FT_Transformer.Head(
-            d_in=in_features,
-            d_out=num_classes,
-            bias=True,
-            activation=head_activation,
-            normalization=head_normalization,
+        self.remainder_transformer = FT_Transformer(
+            d_token=in_features,
+            n_blocks=3 - n_blocks,
+            attention_n_heads=attention_n_heads,
+            attention_dropout=attention_dropout,
+            attention_initialization=attention_initialization,
+            attention_normalization=attention_normalization,
+            ffn_d_hidden=ffn_d_hidden,
+            ffn_dropout=ffn_dropout,
+            ffn_activation=ffn_activation,
+            ffn_normalization=ffn_normalization,
+            residual_dropout=residual_dropout,
+            prenormalization=prenormalization,
+            first_prenormalization=first_prenormalization,
+            last_layer_query_idx=None,
+            n_tokens=None,
+            kv_compression_ratio=kv_compression_ratio,
+            kv_compression_sharing=kv_compression_sharing,
+            head_activation=head_activation,
+            head_normalization=head_normalization,
+            d_out=hidden_features,
+            projection=False,
+            additive_attention=additive_attention,
+            share_qv_weights=share_qv_weights,
+            row_attention=row_attention,
+            row_attention_layer=row_attention_layer,
+            global_token=global_token,
+        )
+
+        self.heads = nn.ModuleDict(
+            {
+                "target": FT_Transformer.Head(
+                    d_in=in_features,
+                    d_out=num_classes,
+                    bias=True,
+                    activation=head_activation,
+                    normalization=head_normalization,
+                ),
+                "contrastive": FT_Transformer.ContrastiveHead(
+                    d_in=in_features,
+                    d_out=in_features,
+                    bias=True,
+                    activation=head_activation,
+                    normalization=head_normalization,
+                )
+                if pretrain_objective in ["contrastive", "both"]
+                else None,
+                "reconstruction": FT_Transformer.ReconstructionHead(
+                    d_in=in_features,
+                    bias=True,
+                    activation=head_activation,
+                    normalization=head_normalization,
+                    n_num_features=num_numerical_columns,
+                    category_sizes=num_categories,
+                )
+                if pretrain_objective in ["reconstruction", "both"]
+                else None,
+            }
         )
 
         self.cls_token = CLSToken(
             d_token=in_features,
             initialization="uniform",
         )
+        
+        if self.pretrain_cls:
+            self.fusion_transformer = nn.ModuleDict(
+                {
+                    "fusion_transformer": self.fusion_transformer,
+                    "cls_token": self.cls_token,
+                }
+            )
 
         self.out_features = in_features
 
         # init weights
         self.adapter.apply(init_weights)
-        self.head.apply(init_weights)
+        self.heads.apply(init_weights)
 
         self.prefix = prefix
 
@@ -388,6 +463,7 @@ class MultimodalFusionTransformer(nn.Module):
     def forward(
         self,
         batch: dict,
+        head: Optional[str] = "target",
     ):
         multimodal_features = []
         output = {}
@@ -403,10 +479,11 @@ class MultimodalFusionTransformer(nn.Module):
                 output.update(per_output)
 
         multimodal_features = torch.cat(multimodal_features, dim=1)
-        multimodal_features = self.cls_token(multimodal_features)
-        features = self.fusion_transformer(multimodal_features)
+        multimodal_features = self.fusion_transformer["cls_token"](multimodal_features) if self.pretrain_cls else self.cls_token(multimodal_features)
+        features = self.fusion_transformer["fusion_transformer"](multimodal_features) if self.pretrain_cls else self.fusion_transformer(multimodal_features)
+        features = self.remainder_transformer(features)
 
-        logits = self.head(features)
+        logits = self.heads[head](features)
         fusion_output = {
             self.prefix: {
                 LOGITS: logits,

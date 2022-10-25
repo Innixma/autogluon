@@ -1,0 +1,9 @@
+pretrainer:
+  pretrain_epochs: 5
+  augmentation_type: "permutation" # support "permutation" or "identical"
+  corruption_rate: 0.6
+  start_pretrain_coefficient: 1
+  end_pretrain_coefficient: 0.01
+  decay_pretrain_coefficient: 0.6
+  objective: "reconstruction" # support "contrastive", "reconstruction", "both" or "self_distill"
+  temperature: 1

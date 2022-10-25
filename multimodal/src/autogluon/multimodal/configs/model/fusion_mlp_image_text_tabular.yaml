@@ -24,6 +24,9 @@ model:
     - categorical
     additive_attention: False
     share_qv_weights: False
+    row_attention: False
+    row_attention_layer: "last"
+    global_token: False
   numerical_mlp:
     hidden_size: 128
     activation: "leaky_relu"
@@ -55,6 +58,9 @@ model:
     merge: "concat"
     additive_attention: False
     share_qv_weights: False
+    row_attention: False
+    row_attention_layer: "last"
+    global_token: False
   hf_text:
     checkpoint_name: "google/electra-base-discriminator"
     gradient_checkpointing: False
@@ -215,3 +221,7 @@ model:
     data_types:
     additive_attention: False
     share_qv_weights: False
+    row_attention: False
+    row_attention_layer: "last"
+    global_token: False
+

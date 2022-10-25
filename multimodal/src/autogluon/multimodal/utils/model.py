@@ -240,6 +240,9 @@ def create_model(
             ffn_d_hidden=OmegaConf.select(model_config, "ffn_d_hidden", default=192),
             additive_attention=OmegaConf.select(model_config, "additive_attention", default=False),
             share_qv_weights=OmegaConf.select(model_config, "share_qv_weights", default=False),
+            row_attention=OmegaConf.select(model_config, "row_attention", default=False),
+            row_attention_layer=OmegaConf.select(model_config, "row_attention_layer", default=None),
+            global_token=OmegaConf.select(model_config, "global_token", default=False),
         )
     elif model_name.lower().startswith(CATEGORICAL_MLP):
         model = CategoricalMLP(
@@ -273,6 +276,9 @@ def create_model(
             cls_token=False,
             additive_attention=OmegaConf.select(model_config, "additive_attention", default=False),
             share_qv_weights=OmegaConf.select(model_config, "share_qv_weights", default=False),
+            row_attention=OmegaConf.select(model_config, "row_attention", default=False),
+            row_attention_layer=OmegaConf.select(model_config, "row_attention_layer", default=None),
+            global_token=OmegaConf.select(model_config, "global_token", default=False),
         )
     elif model_name.lower().startswith(MMDET_IMAGE):
         model = MMDetAutoModelForObjectDetection(
@@ -333,6 +339,12 @@ def create_model(
             loss_weight=model_config.weight if hasattr(model_config, "weight") else None,
             additive_attention=OmegaConf.select(model_config, "additive_attention", default=False),
             share_qv_weights=OmegaConf.select(model_config, "share_qv_weights", default=False),
+            row_attention=OmegaConf.select(model_config, "row_attention", default=False),
+            row_attention_layer=OmegaConf.select(model_config, "row_attention_layer", default=None),
+            num_categories=num_categories,
+            num_numerical_columns=num_numerical_columns,
+            pretrain_objective=OmegaConf.select(model_config, "pretrain_objective", default=None),
+            global_token=OmegaConf.select(model_config, "global_token", default=False),
         )
     else:
         raise ValueError(f"unknown model name: {model_name}")

@@ -12,7 +12,7 @@ import sys
 import warnings
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Union
-
+import boto3
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
@@ -88,6 +88,7 @@ from .optimization.lit_distiller import DistillerLitModule
 from .optimization.lit_mmdet import MMDetLitModule
 from .optimization.lit_module import LitModule
 from .optimization.lit_ner import NerLitModule
+from .optimization.lit_pretrainer import PretrainLitModule
 from .optimization.losses import RKDLoss
 from .optimization.utils import (
     get_loss_func,
@@ -141,6 +142,7 @@ from .utils import (
     tensor_to_ndarray,
     try_to_infer_pos_label,
     turn_on_off_feature_column_info,
+    update_tabular_config_by_resources,
     update_config_by_rules,
     use_realtime,
 )
@@ -354,6 +356,7 @@ class MultiModalPredictor:
         seed: Optional[int] = 123,
         standalone: Optional[bool] = True,
         hyperparameter_tune_kwargs: Optional[dict] = None,
+        is_pretrain=False,
     ):
         """
         Fit MultiModalPredictor predict label column of a dataframe based on the other columns,
@@ -622,6 +625,7 @@ class MultiModalPredictor:
             teacher_predictor=teacher_predictor,
             standalone=standalone,
             hpo_mode=(hyperparameter_tune_kwargs is not None),  # skip average checkpoint if in hpo mode
+            is_pretrain_=is_pretrain,
         )
 
         if hyperparameter_tune_kwargs is not None:
@@ -897,16 +901,28 @@ class MultiModalPredictor:
         teacher_predictor: Union[str, MultiModalPredictor] = None,
         hpo_mode: bool = False,
         standalone: bool = True,
+        is_pretrain_=False,
         **hpo_kwargs,
     ):
+        print("----------fitting---------------", is_pretrain_)
+
         if self._config is not None:  # continuous training
             config = self._config
+
+        is_pretrain = hyperparameters.pop("pretrainer") if "pretrainer" in hyperparameters else False
+        finetune_on = hyperparameters.pop("finetune_on") if "finetune_on" in hyperparameters else None
+
+        extra = []
+        if teacher_predictor is not None:
+            extra.append("distiller")
+        if is_pretrain:
+            extra.append("pretrainer")
 
         config = get_config(
             presets=presets,
             config=config,
             overrides=hyperparameters,
-            extra=["distiller"] if teacher_predictor is not None else None,
+            extra=extra if extra else None,
         )
 
         config = update_config_by_rules(
@@ -925,6 +941,11 @@ class MultiModalPredictor:
         else:  # continuing training
             df_preprocessor = self._df_preprocessor
 
+        config = update_tabular_config_by_resources(
+            config,
+            num_numerical_columns=len(df_preprocessor.numerical_feature_names),
+            num_categorical_columns=len(df_preprocessor.categorical_num_categories),
+        )
         config = select_model(config=config, df_preprocessor=df_preprocessor)
 
         if self._model is None:
@@ -937,6 +958,33 @@ class MultiModalPredictor:
             )
         else:  # continuing training
             model = self._model
+
+        while True:
+            try:
+                if finetune_on is not None:
+                    foundation_model = finetune_on
+                    s3 = boto3.resource('s3')
+                    s3.Bucket('automl-benchmark-bingzzhu').download_file(
+                        'ec2/2022_09_14/cross_table_pretrain/' + foundation_model,
+                        './pretrained.ckpt'
+                    )
+                    pretrain_path = os.path.join("./", 'pretrained.ckpt')
+                    state_dict = torch.load(pretrain_path, map_location=torch.device("cuda"))["state_dict"]
+                    model.fusion_transformer.load_state_dict(state_dict)
+                break
+            except:
+                pass
+
+        if "few_shot" in is_pretrain_:
+            n = is_pretrain_["few_shot"]
+            if isinstance(n, int):
+                train_n = min(n, len(train_df.index))
+                train_df = train_df.sample(n=train_n, random_state=1)
+                val_n = min(n, len(val_df.index))
+                val_df = val_df.sample(n=val_n, random_state=1)
+            elif isinstance(n, float):
+                train_df = train_df.sample(frac=n, random_state=1)
+                # val_df = val_df.sample(frac=n, random_state=1)
 
         norm_param_names = get_norm_layer_param_names(model)
 
@@ -1069,6 +1117,7 @@ class MultiModalPredictor:
             lr_mult=config.optimization.lr_mult,
             weight_decay=config.optimization.weight_decay,
             warmup_steps=config.optimization.warmup_steps,
+            row_attention_weight_decay=config.optimization.row_attention_weight_decay,
         )
         metrics_kwargs = dict(
             validation_metric=validation_metric,
@@ -1119,6 +1168,28 @@ class MultiModalPredictor:
         elif self._pipeline == OBJECT_DETECTION:
             task = MMDetLitModule(
                 model=model,
+                **metrics_kwargs,
+                **optimization_kwargs,
+            )
+        elif is_pretrain:
+            task = PretrainLitModule(
+                model=model,
+                loss_func=loss_func,
+                efficient_finetune=OmegaConf.select(config, "optimization.efficient_finetune"),
+                mixup_fn=mixup_fn,
+                mixup_off_epoch=OmegaConf.select(config, "data.mixup.turn_off_epoch"),
+                model_postprocess_fn=model_postprocess_fn,
+                trainable_param_names=trainable_param_names,
+                pretrain_epochs=config.pretrainer.pretrain_epochs,
+                problem_type=self.problem_type,
+                augmentation_mode=config.pretrainer.augmentation_type,
+                corruption_rate=config.pretrainer.corruption_rate,
+                start_loss_coefficient=config.pretrainer.start_pretrain_coefficient,
+                end_loss_coefficient=config.pretrainer.end_pretrain_coefficient,
+                decay_loss_coefficient=config.pretrainer.decay_pretrain_coefficient,
+                pretrain_objective=config.pretrainer.objective,
+                temperature=config.pretrainer.temperature,
+                is_pretrain=is_pretrain_,
                 **metrics_kwargs,
                 **optimization_kwargs,
             )
@@ -1280,11 +1351,37 @@ class MultiModalPredictor:
                 ".* in the `DataLoader` init to improve performance.*",
             )
             warnings.filterwarnings("ignore", "Checkpoint directory .* exists and is not empty.")
-            trainer.fit(
-                task,
-                datamodule=train_dm,
-                ckpt_path=ckpt_path if resume else None,  # this is to resume training that was broken accidentally
-            )
+            if not is_pretrain_["is_pretrain"]:
+                trainer.fit(
+                    task,
+                    datamodule=train_dm,
+                    ckpt_path=ckpt_path if resume else None,  # this is to resume training that was broken accidentally
+                )
+            else:
+                try:
+                    trainer.fit(
+                        task,
+                        datamodule=train_dm,
+                        ckpt_path=ckpt_path if resume else None,  # this is to resume training that was broken accidentally
+                    )
+                except:
+                    pass
+
+                while True:
+                    try:
+                        target = 'ec2/2022_09_14/cross_table_pretrain/' + is_pretrain_["folder_name"] + '/iter_' + str(-1) + '/' + is_pretrain_[
+                            'name'] + '.ckpt'
+                        checkpoint = {
+                            "state_dict": {name: param for name, param in
+                                        self._model.fusion_transformer.state_dict().items()}
+                        }
+                        torch.save(checkpoint, os.path.join("./", "pretrained.ckpt"))
+                        s3 = boto3.resource('s3')
+                        s3.Bucket('automl-benchmark-bingzzhu').upload_file('./pretrained.ckpt', target)
+                        break
+                    except:
+                        pass
+
             self._fit_called = True
 
         if trainer.global_rank == 0:
@@ -1986,6 +2083,50 @@ class MultiModalPredictor:
         realtime: Optional[bool] = None,
         seed: Optional[int] = 123,
     ):
+        if not hasattr(self._model, "row_attention") or not self._model.row_attention:
+            return self.predict_single_round(
+                data=data,
+                candidate_data=candidate_data,
+                as_pandas=as_pandas,
+                realtime=realtime,
+                seed=seed,
+            )
+
+        pred = []
+        for _ in range(self._config.env.test_ensemble_rounds):
+            print(_)
+            data_ = copy.deepcopy(data)
+            data_.reset_index(drop=True, inplace=True)
+            perm = np.random.RandomState().permutation(data_.shape[0])
+            data_ = data_.reindex(perm)
+            data_.reset_index(drop=True, inplace=True)
+
+            per_pred = self.predict_single_round(
+                data=data_,
+                candidate_data=candidate_data,
+                as_pandas=as_pandas,
+                realtime=realtime,
+                seed=seed,
+            )
+
+            inverse_perm = np.argsort(perm)
+            per_pred = per_pred[inverse_perm]
+            pred.append(per_pred)
+
+        pred = np.median(pred, axis=0)
+
+        if (as_pandas is None and isinstance(data, pd.DataFrame)) or as_pandas is True:
+            pred = self._as_pandas(data=data, to_be_converted=pred)
+        return pred
+
+    def predict_single_round(
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        candidate_data: Optional[Union[pd.DataFrame, dict, list]] = None,
+        as_pandas: Optional[bool] = None,
+        realtime: Optional[bool] = None,
+        seed: Optional[int] = 123,
+    ):
         """
         Predict values for the label column of new data.
 
@@ -2054,12 +2195,64 @@ class MultiModalPredictor:
                 else:
                     pred = logits
 
-        if (as_pandas is None and isinstance(data, pd.DataFrame)) or as_pandas is True:
-            pred = self._as_pandas(data=data, to_be_converted=pred)
-
         return pred
 
     def predict_proba(
+        self,
+        data: Union[pd.DataFrame, dict, list],
+        candidate_data: Optional[Union[pd.DataFrame, dict, list]] = None,
+        as_pandas: Optional[bool] = None,
+        as_multiclass: Optional[bool] = True,
+        realtime: Optional[bool] = None,
+        seed: Optional[int] = 123,
+    ):
+        if not hasattr(self._model, "row_attention") or not self._model.row_attention:
+            return self.predict_proba_single_round(
+                data=data,
+                candidate_data=candidate_data,
+                as_pandas=as_pandas,
+                as_multiclass=as_multiclass,
+                realtime=realtime,
+                seed=seed,
+            )
+
+        prob = []
+        for _ in range(self._config.env.test_ensemble_rounds):
+            data_ = copy.deepcopy(data)
+            data_.reset_index(drop=True, inplace=True)
+            perm = np.random.RandomState().permutation(data_.shape[0])
+            data_ = data_.reindex(perm)
+            data_.reset_index(drop=True, inplace=True)
+
+            per_prob = self.predict_proba_single_round(
+                data=data_,
+                candidate_data=candidate_data,
+                as_pandas=as_pandas,
+                as_multiclass=as_multiclass,
+                realtime=realtime,
+                seed=seed,
+            )
+
+            inverse_perm = np.argsort(perm)
+            per_prob = per_prob[inverse_perm]
+            prob.append(per_prob)
+
+        prob = np.median(prob, axis=0)
+
+        if not as_multiclass:
+            if self._problem_type == BINARY:
+                pos_label = try_to_infer_pos_label(
+                    data_config=self._config.data,
+                    label_encoder=self._df_preprocessor.label_generator,
+                    problem_type=self._problem_type,
+                )
+                prob = prob[:, pos_label]
+
+        if (as_pandas is None and isinstance(data, pd.DataFrame)) or as_pandas is True:
+            prob = self._as_pandas(data=data, to_be_converted=prob)
+        return prob
+
+    def predict_proba_single_round(
         self,
         data: Union[pd.DataFrame, dict, list],
         candidate_data: Optional[Union[pd.DataFrame, dict, list]] = None,
@@ -2116,18 +2309,6 @@ class MultiModalPredictor:
             logits = extract_from_output(outputs=outputs, ret_type=LOGITS)
 
             prob = logits_to_prob(logits)
-
-        if not as_multiclass:
-            if self._problem_type == BINARY:
-                pos_label = try_to_infer_pos_label(
-                    data_config=self._config.data,
-                    label_encoder=self._df_preprocessor.label_generator,
-                    problem_type=self._problem_type,
-                )
-                prob = prob[:, pos_label]
-
-        if (as_pandas is None and isinstance(data, pd.DataFrame)) or as_pandas is True:
-            prob = self._as_pandas(data=data, to_be_converted=prob)
 
         return prob
 

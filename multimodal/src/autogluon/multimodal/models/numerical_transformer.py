@@ -384,6 +384,9 @@ class NumericalTransformer(nn.Module):
         embedding_arch: Optional[List[str]] = ["linear"],
         additive_attention: Optional[bool] = False,
         share_qv_weights: Optional[bool] = False,
+        row_attention: Optional[bool] = False,
+        row_attention_layer: Optional[str] = None,
+        global_token: Optional[bool] = False,
     ):
         """
         Parameters
@@ -461,6 +464,7 @@ class NumericalTransformer(nn.Module):
 
         self.prefix = prefix
         self.out_features = out_features
+        self.row_attention = row_attention
 
         self.numerical_feature_tokenizer = NumEmbeddings(
             in_features=in_features,
@@ -508,6 +512,9 @@ class NumericalTransformer(nn.Module):
             d_out=out_features,
             additive_attention=additive_attention,
             share_qv_weights=share_qv_weights,
+            row_attention=row_attention,
+            row_attention_layer=row_attention_layer,
+            global_token=global_token,
         )
 
         self.head = FT_Transformer.Head(

@@ -45,6 +45,7 @@ class LitModule(pl.LightningModule):
         mixup_fn: Optional[MixupModule] = None,
         mixup_off_epoch: Optional[int] = 0,
         model_postprocess_fn: Callable = None,
+        row_attention_weight_decay: Optional[float] = None,
     ):
         """
         Parameters
@@ -326,6 +327,7 @@ class LitModule(pl.LightningModule):
         else:
             logger.debug("applying single learning rate...")
             grouped_parameters = apply_single_lr(
+                row_attention_weight_decay=self.hparams.row_attention_weight_decay,
                 **kwargs,
             )
 
