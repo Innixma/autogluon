@@ -21,7 +21,7 @@ from ...hpo.exceptions import EmptySearchSpace
 from ...utils.exceptions import TimeLimitExceeded
 from ...utils.loaders import load_pkl
 from ...utils.savers import save_pkl
-from ...utils.utils import CVSplitter, _compute_fi_with_stddev
+from ...utils.utils import CVSplitter, _compute_fi_with_stddev, get_pred_from_proba
 from ..abstract.abstract_model import AbstractModel
 from ..abstract.model_trial import model_trial, skip_hpo
 from .fold_fitting_strategy import (
@@ -87,6 +87,7 @@ class BaggedEnsembleModel(AbstractModel):
         # FIXME: Avoid unnecessary refit during refit_full on `_child_oof=True` models, just re-use the original model.
         self._child_oof = False  # Whether the OOF preds were taken from a single child model (Assumes child can produce OOF preds without bagging).
         self._cv_splitters = []  # Keeps track of the CV splitter used for each bagged repeat.
+        self._fold_indices = []
         self._params_aux_child = None  # aux params of child model
 
         super().__init__(problem_type=self.model_base.problem_type, eval_metric=self.model_base.eval_metric, **kwargs)
@@ -356,6 +357,32 @@ class BaggedEnsembleModel(AbstractModel):
 
         return pred_proba
 
+    def predict_folds(self, X, **kwargs):
+        y_pred_probas = self.predict_proba_folds(X, **kwargs)
+        y_preds = []
+        for y_pred_proba in y_pred_probas:
+            y_pred = get_pred_from_proba(y_pred_proba=y_pred_proba, problem_type=self.problem_type)
+            y_preds.append(y_pred)
+        return y_preds
+
+    def predict_proba_folds(self, X, normalize=None, **kwargs):
+        pred_probas = []
+        has_preprocessed = False
+        for i, model in enumerate(self.models):
+            model = self.load_child(model)
+            if not has_preprocessed:
+                X = self.preprocess(X, model=model, **kwargs)
+                has_preprocessed = True
+            pred_proba = model.predict_proba(X=X, preprocess_nonadaptive=False, normalize=normalize)
+
+            if self.params_aux.get("temperature_scalar", None) is not None:
+                pred_proba = self._apply_temperature_scaling(pred_proba)
+            elif self.conformalize is not None:
+                pred_proba = self._apply_conformalization(pred_proba)
+
+            pred_probas.append(pred_proba)
+        return pred_probas
+
     def _predict_proba(self, X, normalize=False, **kwargs):
         return self.predict_proba(X=X, normalize=normalize, **kwargs)
 
@@ -489,6 +516,10 @@ class BaggedEnsembleModel(AbstractModel):
             )
         return fold_fitting_strategy
 
+    def _get_train_val_indices_for_fold(self, fold, repeat):
+        kfolds = self._fold_indices[repeat]
+        return kfolds[fold]
+
     def _fit_folds(
         self,
         X,
@@ -525,7 +556,7 @@ class BaggedEnsembleModel(AbstractModel):
             # If current cv_splitter doesn't have enough n_repeats for all folds, then create a new one.
             cv_splitter = self._get_cv_splitter(n_splits=k_fold, n_repeats=n_repeats, groups=groups)
 
-        fold_fit_args_list, n_repeats_started, n_repeats_finished = self._generate_fold_configs(
+        fold_fit_args_list, n_repeats_started, n_repeats_finished, kfolds = self._generate_fold_configs(
             X=X,
             y=y,
             cv_splitter=cv_splitter,
@@ -604,6 +635,7 @@ class BaggedEnsembleModel(AbstractModel):
             self._oof_pred_model_repeats += oof_pred_model_repeats
 
         self._cv_splitters += [cv_splitter for _ in range(n_repeats_started)]
+        self._fold_indices += [kfolds for _ in range(n_repeats_started)]
         self._k_per_n_repeat += [k_fold for _ in range(n_repeats_finished)]
         self._n_repeats = n_repeats
         if k_fold == k_fold_end:
@@ -616,7 +648,7 @@ class BaggedEnsembleModel(AbstractModel):
             self._n_repeats_finished = self._n_repeats - 1
 
     @staticmethod
-    def _generate_fold_configs(*, X, y, cv_splitter, k_fold_start, k_fold_end, n_repeat_start, n_repeat_end) -> (list, int, int):
+    def _generate_fold_configs(*, X, y, cv_splitter, k_fold_start, k_fold_end, n_repeat_start, n_repeat_end) -> (list, int, int, list):
         """
         Generates fold configs given a cv_splitter, k_fold start-end and n_repeat start-end.
         Fold configs are used by inheritors of FoldFittingStrategy when fitting fold models.
@@ -659,7 +691,7 @@ class BaggedEnsembleModel(AbstractModel):
 
         assert len(fold_fit_args_list) == folds_to_fit, "fold_fit_args_list is not the expected length!"
 
-        return fold_fit_args_list, n_repeats_started, n_repeats_finished
+        return fold_fit_args_list, n_repeats_started, n_repeats_finished, kfolds
 
     # TODO: Augment to generate OOF after shuffling each column in X (Batching), this is the fastest way.
     # TODO: Reduce logging clutter during OOF importance calculation (Currently logs separately for each child)

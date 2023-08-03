@@ -4138,6 +4138,32 @@ class TabularPredictor:
                 error_message = f"{error_message} `.{message_suffix}`."
             raise AssertionError(error_message)
 
+    def get_conformal_predictions(self, test_data, model: str) -> (List[np.ndarray], List[np.ndarray], List[np.ndarray]):
+        self._assert_is_fit("get_conformal_predictions")
+        if self.problem_type != REGRESSION:
+            raise AssertionError(f'conformal predictions only implemented for problem_type="{REGRESSION}" (problem_type is "{self.problem_type}")')
+
+        cross_val_outputs, cross_val_targets, cross_test_outputs = [], [], []
+
+        model_pred_val = self.predict_multi(models=[model])[model]
+        model_obj = self._trainer.load_model(model)
+
+        test_internal = self.transform_features(data=test_data, model=model)
+        y_pred_test_per_fold = model_obj.predict_folds(test_internal)
+
+        val_data_source = "val" if self._trainer.has_val else "train"
+        _, y_val = self.load_data_internal(data=val_data_source, return_X=False, return_y=True)
+
+        n_splits = len(model_obj.models)  # FIXME: Will break with multiple repeats
+        for i in range(n_splits):
+            train_idx, val_idx = model_obj._get_train_val_indices_for_fold(fold=i, repeat=0)
+            cross_val_output = model_pred_val[val_idx]  # FIXME: Maybe loc
+            cross_val_outputs.append(cross_val_output)
+            cross_val_targets.append(y_val[val_idx].values)
+            cross_test_outputs.append(y_pred_test_per_fold[i])
+
+        return cross_val_outputs, cross_val_targets, cross_test_outputs
+
 
 # Location to store WIP functionality that will be later added to TabularPredictor
 class _TabularPredictorExperimental(TabularPredictor):
