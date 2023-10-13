@@ -8,8 +8,7 @@ import os
 import pprint
 import shutil
 import time
-import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 import numpy as np
@@ -1629,6 +1628,93 @@ class TabularPredictor:
             )
         data = self._get_dataset(data)
         return self._learner.predict_proba(X=data, model=model, as_pandas=as_pandas, as_multiclass=as_multiclass, transform_features=transform_features)
+
+    def predict_conformal_set(
+        self,
+        val_data: str | TabularDataset | pd.DataFrame,
+        test_data: str | TabularDataset | pd.DataFrame,
+        coverage: float,
+        model: str | None = None,
+    ) -> Dict[str, Union[List[List[int]], np.ndarray]]:
+        """
+        Predict conformal sets at a specified coverage for each input in the test data.
+        Currently, this method is supported only for binary and multi-class classification. In the case of
+
+        Parameters
+        ----------
+        val_data: str | TabularDataset | pd.DataFrame
+            Validation data.
+        test_data: str | TabularDataset | pd.DataFrame
+            Test data.
+        coverage: float
+            Target coverage.
+        model : str (optional)
+            The name of the model to get prediction probabilities from. Defaults to None, which uses the highest scoring model on the validation set.
+            Valid models are listed in this `predictor` by calling `predictor.get_model_names()`.
+
+        Returns
+        -------
+        Dict[str, Union[List[List[int]], np.ndarray]]
+            A conformal set for each input in the test data.
+        """
+        try:
+            import fortuna
+        except ImportError:
+            raise ImportError("`aws-fortuna` must be installed to use this method.")
+
+        if not isinstance(coverage, float) or coverage < 0 or coverage > 1:
+            raise ValueError("`coverage` must be a float in [0, 1].")
+
+        if self.problem_type not in [BINARY, MULTICLASS, REGRESSION]:
+            raise ValueError(f"This method is not supported for `problem_type={self.problem_type}`.")
+
+        model_names = [model] if model is not None else self.get_model_names()
+        results = dict()
+
+        for model_name in model_names:
+            model = self._trainer.load_model(model_name)
+
+            if self.problem_type in [BINARY, MULTICLASS]:
+                X_val_internal = self.transform_features(data=val_data, model=model_name)
+                y_val_internal = self.transform_labels(labels=val_data[self.label]).astype(int)
+                y_probs_val = model.predict_proba(X_val_internal)
+                if y_probs_val.ndim == 1:
+                    y_probs_val = np.stack([1 - y_probs_val, y_probs_val], axis=1)
+
+                X_test_internal = self.transform_features(data=test_data)
+                y_probs_test = model.predict_proba(X_test_internal)
+                if y_probs_test.ndim == 1:
+                    y_probs_test = np.stack([1 - y_probs_test, y_probs_test], axis=1)
+
+                from fortuna.conformal import AdaptivePredictionConformalClassifier
+                results[model_name] = AdaptivePredictionConformalClassifier().conformal_set(
+                    val_probs=y_probs_val,
+                    val_targets=y_val_internal.values.astype(int),
+                    test_probs=y_probs_test,
+                    error=1 - coverage
+                )
+
+            elif self.problem_type == REGRESSION:
+                num_folds = len(model.models)
+                if num_folds <= 1:
+                    logging.info(f"Skipping `{model_name}` because not enough folds.")
+                    continue
+
+                cross_val_outputs, cross_val_targets, cross_test_outputs = self.get_cross_val_quantities(
+                    test_data=test_data,
+                    model=model_name,
+                )
+
+                from fortuna.conformal import CVPlusConformalRegressor
+                results[model_name] = np.array(
+                    CVPlusConformalRegressor().conformal_interval(
+                        cross_val_outputs=cross_val_outputs,
+                        cross_val_targets=cross_val_targets,
+                        cross_test_outputs=cross_test_outputs,
+                        error=1 - coverage,
+                    )
+                )
+        return results
 
     def get_pred_from_proba(self, y_pred_proba: pd.DataFrame | np.ndarray, decision_threshold: float | None = None) -> pd.Series | np.array:
         """
@@ -4138,31 +4224,46 @@ class TabularPredictor:
                 error_message = f"{error_message} `.{message_suffix}`."
             raise AssertionError(error_message)
 
-    def get_conformal_predictions(self, test_data, model: str) -> (List[np.ndarray], List[np.ndarray], List[np.ndarray]):
-        self._assert_is_fit("get_conformal_predictions")
-        if self.problem_type != REGRESSION:
-            raise AssertionError(f'conformal predictions only implemented for problem_type="{REGRESSION}" (problem_type is "{self.problem_type}")')
+    def get_cross_val_quantities(self, test_data, model: str) -> (List[np.ndarray], List[np.ndarray], List[np.ndarray]):
+        self._assert_is_fit("get_cross_val_values")
 
-        cross_val_outputs, cross_val_targets, cross_test_outputs = [], [], []
-
-        model_pred_val = self.predict_multi(models=[model])[model]
         model_obj = self._trainer.load_model(model)
-
         test_internal = self.transform_features(data=test_data, model=model)
-        y_pred_test_per_fold = model_obj.predict_folds(test_internal)
-
         val_data_source = "val" if self._trainer.has_val else "train"
         _, y_val = self.load_data_internal(data=val_data_source, return_X=False, return_y=True)
-
         n_splits = len(model_obj.models)  # FIXME: Will break with multiple repeats
-        for i in range(n_splits):
-            train_idx, val_idx = model_obj._get_train_val_indices_for_fold(fold=i, repeat=0)
-            cross_val_output = model_pred_val[val_idx]  # FIXME: Maybe loc
-            cross_val_outputs.append(cross_val_output)
-            cross_val_targets.append(y_val[val_idx].values)
-            cross_test_outputs.append(y_pred_test_per_fold[i])
 
-        return cross_val_outputs, cross_val_targets, cross_test_outputs
+        if self.problem_type == REGRESSION:
+            cross_val_outputs, cross_val_targets, cross_test_outputs = [], [], []
+
+            model_pred_val = self.predict_multi(models=[model])[model]
+            y_pred_test_per_fold = model_obj.predict_folds(test_internal)
+
+            for i in range(n_splits):
+                train_idx, val_idx = model_obj._get_train_val_indices_for_fold(fold=i, repeat=0)
+                cross_val_output = model_pred_val[val_idx]  # FIXME: Maybe loc
+                cross_val_outputs.append(cross_val_output)
+                cross_val_targets.append(y_val[val_idx].values)
+                cross_test_outputs.append(y_pred_test_per_fold[i])
+
+            return cross_val_outputs, cross_val_targets, cross_test_outputs
+
+        if self.problem_type in [BINARY, MULTICLASS]:
+            cross_val_probs, cross_val_targets, cross_test_probs = [], [], []
+
+            model_probs_val = self.predict_proba_multi(models=[model])[model]
+            y_prob_test_per_fold = model_obj.predict_proba_folds(test_internal)
+
+            for i in range(n_splits):
+                train_idx, val_idx = model_obj._get_train_val_indices_for_fold(fold=i, repeat=0)
+                cross_val_probs.append(model_probs_val.iloc[val_idx].values)
+                cross_val_targets.append(y_val[val_idx].values)
+                test_probs = y_prob_test_per_fold[i]
+                if test_probs.ndim == 1:
+                    test_probs = np.stack((1 - test_probs, test_probs), axis=1)
+                cross_test_probs.append(test_probs)
+
+            return cross_val_probs, cross_val_targets, cross_test_probs
 
 
 # Location to store WIP functionality that will be later added to TabularPredictor
