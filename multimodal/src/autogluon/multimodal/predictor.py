@@ -975,7 +975,7 @@ class MultiModalPredictor:
             except:
                 pass
 
-        if "few_shot" in is_pretrain_:
+        if is_pretrain_ and ("few_shot" in is_pretrain_):
             n = is_pretrain_["few_shot"]
             if isinstance(n, int):
                 train_n = min(n, len(train_df.index))
@@ -1351,7 +1351,7 @@ class MultiModalPredictor:
                 ".* in the `DataLoader` init to improve performance.*",
             )
             warnings.filterwarnings("ignore", "Checkpoint directory .* exists and is not empty.")
-            if not is_pretrain_["is_pretrain"]:
+            if not is_pretrain_ or not is_pretrain_["is_pretrain"]:
                 trainer.fit(
                     task,
                     datamodule=train_dm,

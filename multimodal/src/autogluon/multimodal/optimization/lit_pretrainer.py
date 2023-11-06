@@ -407,7 +407,7 @@ class PretrainLitModule(LitModule):
         #         tmp += torch.norm(param)
         # print(tmp)
 
-        if self.is_pretrain["is_pretrain"]:
+        if self.is_pretrain and self.is_pretrain["is_pretrain"]:
             if self.current_iter % self.is_pretrain["upload_per_n_iter"] == 0:
                 while True:
                     try:
