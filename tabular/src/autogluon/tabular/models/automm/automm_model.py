@@ -9,7 +9,7 @@ import pandas as pd
 from autogluon.common.features.types import R_OBJECT, R_INT, R_FLOAT, R_CATEGORY, \
     S_TEXT_NGRAM, S_TEXT_AS_CATEGORY, S_TEXT_SPECIAL, S_IMAGE_PATH
 from autogluon.core.constants import REGRESSION
-from autogluon.core.utils import get_cpu_count, get_gpu_count_torch, try_import_autogluon_text
+from autogluon.core.utils import get_cpu_count, get_gpu_count_torch
 from autogluon.core.models import AbstractModel
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,6 @@ class MultiModalPredictorModel(AbstractModel):
 
     def _set_default_params(self):
         super()._set_default_params()
-        try_import_autogluon_text()
 
     def _fit(self,
              X: pd.DataFrame,
@@ -113,7 +112,6 @@ class MultiModalPredictorModel(AbstractModel):
             Other keyword arguments
 
         """
-        try_import_autogluon_text()
         from autogluon.multimodal import MultiModalPredictor
 
         # Decide name of the label column
@@ -196,7 +194,6 @@ class MultiModalPredictorModel(AbstractModel):
     def load(cls, path: str, reset_paths=True, verbose=True):
         model = super().load(path=path, reset_paths=reset_paths, verbose=verbose)
         if model._load_model:
-            try_import_autogluon_text()
             from autogluon.multimodal import MultiModalPredictor
             model.model = MultiModalPredictor.load(os.path.join(path, cls._NN_MODEL_NAME))
         model._load_model = None
