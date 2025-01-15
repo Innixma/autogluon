@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import pandas as pd
+import numpy as np
+from dataclasses import dataclass
 
 
 class AbstractES:
@@ -136,6 +137,14 @@ ES_CLASS_MAP = {
 }
 
 
+@dataclass
+class ESOutput:
+    early_stop: bool
+    is_best: bool
+    is_best_or_tie: bool
+    score: float
+
+
 class ESWrapper:
     def __init__(
         self,
@@ -160,7 +169,7 @@ class ESWrapper:
         self.best_score = None
         self.round_to_use = None  # round to use at test time
 
-    def update(self, y: pd.Series, y_pred_proba: pd.Series, cur_round: int) -> tuple[bool, bool]:
+    def update(self, y: np.ndarray, y_pred_proba: np.ndarray, cur_round: int) -> ESOutput:
         score = self.score_func(y, y_pred_proba)
         is_best, is_best_or_tie = self._check_is_best(score=score)
         if is_best_or_tie:
@@ -168,7 +177,13 @@ class ESWrapper:
         if is_best:
             self.best_score = score
         early_stop = self.es.update(cur_round=cur_round, is_best=is_best)
-        return early_stop, is_best_or_tie
+        es_output = ESOutput(
+            early_stop=early_stop,
+            is_best=is_best,
+            is_best_or_tie=is_best_or_tie,
+            score=score,
+        )
+        return es_output
 
     def _check_is_best(self, score: float) -> tuple[bool, bool]:
         if self.best_score is None:

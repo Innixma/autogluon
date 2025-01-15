@@ -305,21 +305,18 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         from autogluon.core.utils.early_stopping import ESWrapper
         es_wrapper = ESWrapper(es=copy.deepcopy(early_stopping_method), score_func=score_method, best_is_later_if_tie=True)
 
-        y_pred_proba_val_best = None
         y_pred_proba_val_best_oof = None
         # FIXME: Move everything into early stopping class?
         if val_dataset is not None:
             len_val = len(val_dataset)
             best_val_metric_oof = np.full(len_val, -np.inf)  # higher = better
-            best_epoch_oof = np.zeros(len_val)  # higher = better
             early_stop_oof = np.zeros(len_val, dtype=np.bool_)
-            early_stopping_method_val_lst = [copy.deepcopy(early_stopping_method) for _ in range(len_val)]
+            early_stopping_wrapper_val_lst = [copy.deepcopy(es_wrapper) for _ in range(len_val)]
         else:
             len_val = None
             best_val_metric_oof = None
-            best_epoch_oof = None
             early_stop_oof = None
-            early_stopping_method_val_lst = None
+            early_stopping_wrapper_val_lst = None
 
         ag_params = self._get_ag_params()
         generate_curves = ag_params.get("generate_curves", False)
@@ -470,12 +467,6 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
 
             # validation
             if val_dataset is not None:
-                is_best = False
-                # compute validation score
-                val_metric = self.score(X=val_dataset, y=y_val, metric=self.stopping_metric, _reset_threads=False)
-                if not self._assert_valid_metric(metric=val_metric, best_epoch=best_epoch):
-                    break
-
                 # FIXME: Fails in rare scenarios where can't calculate metric with n-1 samples (all same class, n=1, etc.)
                 # FIXME: Remove redundant predict call in `self.score`
                 # FIXME: Maybe need to use sample weight to correct for the class that is removed?
@@ -486,8 +477,25 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                 else:
                     y_pred_val_to_use = y_pred_proba_val
 
-                # early_stop_wr, is_best_or_tie_wr = es_wrapper.update(y=y_val, y_pred_proba=y_pred_val_to_use, cur_round=epoch - 1)
-                # print("v2", epoch, early_stop_wr, is_best_or_tie_wr)
+                if early_stop:
+                    # compute validation score
+                    val_metric = score_method(y_val, y_pred_val_to_use)
+                else:
+                    es_output = es_wrapper.update(y=y_val, y_pred_proba=y_pred_val_to_use, cur_round=epoch - 1)
+                    early_stop = es_output.early_stop
+                    val_metric = es_output.score
+                    print("v2", epoch, early_stop, es_output.is_best_or_tie)
+
+                    # update best validation
+                    if es_output.is_best_or_tie:
+                        best_val_metric = val_metric
+                        io_buffer = io.BytesIO()
+                        torch.save(self.model, io_buffer)  # nosec B614
+                        best_epoch = epoch
+                        best_val_update = total_updates
+
+                if not self._assert_valid_metric(metric=val_metric, best_epoch=best_epoch):
+                    break
 
                 if y_pred_proba_val_best_oof is None:
                     y_pred_proba_val_best_oof = copy.deepcopy(y_pred_proba_val)
@@ -497,21 +505,20 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                         y_val_i = np.delete(y_val, i)
                         y_pred_val_to_use_i = np.delete(y_pred_val_to_use, i)
 
-                        val_metric_i = score_method(y_val_i, y_pred_val_to_use_i, metric=self.stopping_metric)
-                        # print(f"{i}\t{val_metric_i}")
-                        oof_val_metrics[i] = val_metric_i
+                        es_output = early_stopping_wrapper_val_lst[i].update(
+                            y=y_val_i,
+                            y_pred_proba=y_pred_val_to_use_i,
+                            cur_round=epoch-1,
+                        )
+
+                        oof_val_metrics[i] = es_output.score
+                        early_stop_oof[i] = es_output.early_stop
 
                         # update best validation
-                        old_best = best_val_metric_oof[i]
-                        is_best_i = False
-                        if (val_metric_i >= best_val_metric_oof[i]) or best_epoch_oof[i] == 0:
-                            if val_metric_i > best_val_metric_oof[i]:
-                                is_best_i = True
-                            best_val_metric_oof[i] = val_metric_i
-                            best_epoch_oof[i] = epoch
+                        if es_output.is_best_or_tie:
+                            best_val_metric_oof[i] = early_stopping_wrapper_val_lst[i].best_score
                             y_pred_proba_val_best_oof[i] = y_pred_proba_val[i]
 
-                        early_stop_oof[i] = early_stopping_method_val_lst[i].update(cur_round=epoch - 1, is_best=is_best_i)
                         # if i == 50:
                         if early_stop_oof[i]:
                             pass
@@ -527,20 +534,6 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                 # print(epoch)
                 # print(oof_val_metrics[:10])
 
-                if not early_stop:
-                    best_val_metric_old = best_val_metric
-                    # update best validation
-                    if (val_metric >= best_val_metric) or best_epoch == 0:
-                        if val_metric > best_val_metric:
-                            is_best = True
-                        best_val_metric = val_metric
-                        io_buffer = io.BytesIO()
-                        torch.save(self.model, io_buffer)  # nosec B614
-                        best_epoch = epoch
-                        best_val_update = total_updates
-                        y_pred_proba_val_best = y_pred_proba_val
-                    early_stop = early_stopping_method.update(cur_round=epoch-1, is_best=is_best)
-                    print("v1", epoch, early_stop, is_best)
                     # print(f"ALL\t{epoch}\t{val_metric}\t{is_best}\t{early_stopping_method.best_round}\t{early_stop}\t{best_val_metric_old}\t{early_stopping_method.patience + early_stopping_method.best_round}")
                 if verbose_eval:
                     logger.log(
@@ -746,7 +739,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         preds_dataset = np.concatenate(preds_dataset, 0)
         return preds_dataset
 
-    def _generate_dataset(self, X: pd.DataFrame | TabularTorchDataset, y: pd.Series, train_params: dict = {}, is_train: bool = False) -> TabularTorchDataset:
+    def _generate_dataset(self, X: pd.DataFrame | TabularTorchDataset, y: pd.Series, train_params: dict = None, is_train: bool = False) -> TabularTorchDataset:
         """
         Generate TabularTorchDataset from X and y.
 
@@ -756,7 +749,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
             The X data.
         y: pd.Series
             The y data.
-        params: dict
+        train_params: dict = None
             Parameters related to processing training data.
         is_train: bool
             Whether the X and y values are training data.
@@ -766,6 +759,8 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         TabularTorchDataset containing the contents of X and y.
         """
         from .tabular_torch_dataset import TabularTorchDataset
+        if train_params is None:
+            train_params = {}
 
         if is_train:
             impute_strategy = train_params["proc.impute_strategy"]
