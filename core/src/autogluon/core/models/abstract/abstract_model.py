@@ -157,6 +157,7 @@ class AbstractModel:
         self._fit_metadata = dict()
         self.saved_learning_curves = False
 
+        self.y_pred_proba_val_oof_ = None
         self._compiler = None
 
     @classmethod
@@ -1170,6 +1171,27 @@ class AbstractModel:
             y=y,
             y_pred=y_pred,
             y_pred_proba=y_pred_proba,
+            metric=metric,
+            weights=sample_weight,
+            as_error=as_error,
+            quantile_levels=self.quantile_levels,
+        )
+
+    def score_with_y_pred(
+        self,
+        y: np.ndarray,
+        y_pred: np.ndarray,
+        metric: Scorer = None,
+        sample_weight: np.ndarray = None,
+        as_error: bool = False,
+    ) -> float:
+        if metric is None:
+            metric = self.eval_metric
+        if not (metric.needs_pred or metric.needs_quantile):
+            raise AssertionError(f"Metric {metric.name} requires y_pred_proba, but `y_pred` was given.")
+        return compute_metric(
+            y=y,
+            y_pred=y_pred,
             metric=metric,
             weights=sample_weight,
             as_error=as_error,

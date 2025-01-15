@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 
 class AbstractES:
     """
@@ -132,3 +134,60 @@ ES_CLASS_MAP = {
     "simple": SimpleES,
     "adaptive": AdaptiveES,
 }
+
+
+class ESWrapper:
+    def __init__(
+        self,
+        es: AbstractES,
+        score_func,
+        best_is_later_if_tie: bool = True,
+    ):
+        """
+
+        Parameters
+        ----------
+        es: AbstractES
+        score_func
+        best_is_later_if_tie : bool, default True
+            If True, ties for best will consider the earlier round as best for early stopping, but the later round as best for the value of `self.round_to_use`.
+            If False, ties for best will use the earlier round as best for early stopping and for `self.round_to_use`.
+        """
+        self.es = es
+        self.score_func = score_func
+        self.best_is_later_if_tie = best_is_later_if_tie
+
+        self.best_score = None
+        self.round_to_use = None  # round to use at test time
+
+    def update(self, y: pd.Series, y_pred_proba: pd.Series, cur_round: int) -> tuple[bool, bool]:
+        score = self.score_func(y, y_pred_proba)
+        is_best, is_best_or_tie = self._check_is_best(score=score)
+        if is_best_or_tie:
+            self.round_to_use = cur_round
+        if is_best:
+            self.best_score = score
+        early_stop = self.es.update(cur_round=cur_round, is_best=is_best)
+        return early_stop, is_best_or_tie
+
+    def _check_is_best(self, score: float) -> tuple[bool, bool]:
+        if self.best_score is None:
+            is_best = True
+            is_best_or_tie = True
+        elif score > self.best_score:
+            is_best = True
+            is_best_or_tie = True
+        elif score == self.best_score:
+            is_best = False
+            is_best_or_tie = self.best_is_later_if_tie
+        else:
+            is_best = False
+            is_best_or_tie = False
+        return is_best, is_best_or_tie
+
+
+# TODO: Internally make N ESWrapper clones, where N is len(y).
+# TODO: Keep track of y_pred_proba_oof
+# TODO: Implement ES-OOF for bagging
+class ESWrapperOOF(ESWrapper):
+    pass

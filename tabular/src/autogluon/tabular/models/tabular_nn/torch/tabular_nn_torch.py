@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import logging
@@ -296,6 +297,30 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         else:
             early_stopping_method = self._get_early_stopping_strategy(num_rows_train=len(train_dataset))
 
+        if self.stopping_metric.needs_pred or self.stopping_metric.needs_quantile:
+            score_method = self.score_with_y_pred
+        else:
+            score_method = self.score_with_y_pred_proba
+
+        from autogluon.core.utils.early_stopping import ESWrapper
+        es_wrapper = ESWrapper(es=copy.deepcopy(early_stopping_method), score_func=score_method, best_is_later_if_tie=True)
+
+        y_pred_proba_val_best = None
+        y_pred_proba_val_best_oof = None
+        # FIXME: Move everything into early stopping class?
+        if val_dataset is not None:
+            len_val = len(val_dataset)
+            best_val_metric_oof = np.full(len_val, -np.inf)  # higher = better
+            best_epoch_oof = np.zeros(len_val)  # higher = better
+            early_stop_oof = np.zeros(len_val, dtype=np.bool_)
+            early_stopping_method_val_lst = [copy.deepcopy(early_stopping_method) for _ in range(len_val)]
+        else:
+            len_val = None
+            best_val_metric_oof = None
+            best_epoch_oof = None
+            early_stop_oof = None
+            early_stopping_method_val_lst = None
+
         ag_params = self._get_ag_params()
         generate_curves = ag_params.get("generate_curves", False)
 
@@ -368,6 +393,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
             time_limit = time_limit - (start_fit_time - start_time)
             if time_limit <= 0:
                 raise TimeLimitExceeded
+        early_stop = False
         while do_update:
             time_start_epoch = time.time()
             time_cur = time_start_epoch
@@ -450,16 +476,72 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                 if not self._assert_valid_metric(metric=val_metric, best_epoch=best_epoch):
                     break
 
-                # update best validation
-                if (val_metric >= best_val_metric) or best_epoch == 0:
-                    if val_metric > best_val_metric:
-                        is_best = True
-                    best_val_metric = val_metric
-                    io_buffer = io.BytesIO()
-                    torch.save(self.model, io_buffer)  # nosec B614
-                    best_epoch = epoch
-                    best_val_update = total_updates
-                early_stop = early_stopping_method.update(cur_round=epoch-1, is_best=is_best)
+                # FIXME: Fails in rare scenarios where can't calculate metric with n-1 samples (all same class, n=1, etc.)
+                # FIXME: Remove redundant predict call in `self.score`
+                # FIXME: Maybe need to use sample weight to correct for the class that is removed?
+                y_pred_proba_val = self.predict_proba(X=val_dataset, _reset_threads=False)
+                if self.stopping_metric.needs_pred or self.stopping_metric.needs_quantile:
+                    y_pred_val = self.predict_from_proba(y_pred_proba_val)
+                    y_pred_val_to_use = y_pred_val
+                else:
+                    y_pred_val_to_use = y_pred_proba_val
+
+                # early_stop_wr, is_best_or_tie_wr = es_wrapper.update(y=y_val, y_pred_proba=y_pred_val_to_use, cur_round=epoch - 1)
+                # print("v2", epoch, early_stop_wr, is_best_or_tie_wr)
+
+                if y_pred_proba_val_best_oof is None:
+                    y_pred_proba_val_best_oof = copy.deepcopy(y_pred_proba_val)
+                oof_val_metrics = np.zeros(len_val)
+                for i in range(len_val):
+                    if not early_stop_oof[i]:
+                        y_val_i = np.delete(y_val, i)
+                        y_pred_val_to_use_i = np.delete(y_pred_val_to_use, i)
+
+                        val_metric_i = score_method(y_val_i, y_pred_val_to_use_i, metric=self.stopping_metric)
+                        # print(f"{i}\t{val_metric_i}")
+                        oof_val_metrics[i] = val_metric_i
+
+                        # update best validation
+                        old_best = best_val_metric_oof[i]
+                        is_best_i = False
+                        if (val_metric_i >= best_val_metric_oof[i]) or best_epoch_oof[i] == 0:
+                            if val_metric_i > best_val_metric_oof[i]:
+                                is_best_i = True
+                            best_val_metric_oof[i] = val_metric_i
+                            best_epoch_oof[i] = epoch
+                            y_pred_proba_val_best_oof[i] = y_pred_proba_val[i]
+
+                        early_stop_oof[i] = early_stopping_method_val_lst[i].update(cur_round=epoch - 1, is_best=is_best_i)
+                        # if i == 50:
+                        if early_stop_oof[i]:
+                            pass
+                            # print(f"Early stopped New: {i}")
+                        else:
+                            pass
+                            # print(f"{i}\t{epoch}\t{val_metric_i}\t{is_best_i}\t{early_stopping_method_val_lst[i].best_round}\t{early_stop_oof[i]}\t{old_best}\t{early_stopping_method_val_lst[i].patience + early_stopping_method_val_lst[i].best_round}")
+
+                    else:
+                        pass
+                        # print(f"Early stopped: {i}")
+
+                # print(epoch)
+                # print(oof_val_metrics[:10])
+
+                if not early_stop:
+                    best_val_metric_old = best_val_metric
+                    # update best validation
+                    if (val_metric >= best_val_metric) or best_epoch == 0:
+                        if val_metric > best_val_metric:
+                            is_best = True
+                        best_val_metric = val_metric
+                        io_buffer = io.BytesIO()
+                        torch.save(self.model, io_buffer)  # nosec B614
+                        best_epoch = epoch
+                        best_val_update = total_updates
+                        y_pred_proba_val_best = y_pred_proba_val
+                    early_stop = early_stopping_method.update(cur_round=epoch-1, is_best=is_best)
+                    print("v1", epoch, early_stop, is_best)
+                    # print(f"ALL\t{epoch}\t{val_metric}\t{is_best}\t{early_stopping_method.best_round}\t{early_stop}\t{best_val_metric_old}\t{early_stopping_method.patience + early_stopping_method.best_round}")
                 if verbose_eval:
                     logger.log(
                         15,
@@ -480,7 +562,9 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
 
                 # no improvement
                 if early_stop:
-                    break
+                    if early_stop_oof.all():
+                        break
+                    # print(f"NOT ALL STOPPED!")
 
             if epoch >= num_epochs:
                 break
@@ -492,6 +576,19 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                 if time_left < time_epoch_average:
                     logger.log(20, f"\tRan out of time, stopping training early. (Stopping on epoch {epoch})")
                     break
+
+        # print(epoch, best_epoch)
+        # print(best_epoch_oof)
+        # print(f"HOLDOUT: {y_pred_proba_val_best}")
+        # print(f"    OOF: {y_pred_proba_val_best_oof}")
+        # print(f"  DELTA: {y_pred_proba_val_best - y_pred_proba_val_best_oof}")
+        score_oof_final = self.score_with_y_pred_proba(y_val, y_pred_proba=y_pred_proba_val_best_oof, metric=self.stopping_metric)
+
+        print(best_val_metric, score_oof_final, best_val_metric - score_oof_final)
+
+        es_oof = self.params_aux.get("es_oof", False)
+        if es_oof:
+            self.y_pred_proba_val_oof_ = y_pred_proba_val_best_oof
 
         if epoch == 0:
             raise AssertionError("0 epochs trained!")

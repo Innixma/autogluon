@@ -2307,6 +2307,13 @@ class AbstractTabularTrainer(AbstractTrainer):
             elif X_val is not None and y_val is not None:
                 y_pred_proba_val = model.predict_proba(X_val, record_time=True)
                 score = model.score_with_y_pred_proba(y=y_val, y_pred_proba=y_pred_proba_val, sample_weight=w_val)
+                if model.y_pred_proba_val_oof_ is not None:
+                    y_pred_proba_val_oof = model.y_pred_proba_val_oof_
+                    score_oof = model.score_with_y_pred_proba(y=y_val, y_pred_proba=y_pred_proba_val_oof, sample_weight=w_val)
+                    print(score, score_oof)
+                    print("yo")
+                    y_pred_proba_val = y_pred_proba_val_oof
+                    score = score_oof
             elif isinstance(model, BaggedEnsembleModel):
                 if model.is_valid_oof() or isinstance(model, WeightedEnsembleModel):
                     score = model.score_with_oof(y=y, sample_weight=w)
