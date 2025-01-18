@@ -289,6 +289,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         self.model.init_params()
         logging.debug("initialized")
         train_dataloader = train_dataset.build_loader(batch_size, self.num_dataloading_workers, is_test=False)
+        ag_params = self._get_ag_params()
 
         if isinstance(loss_kwargs.get("loss_function", "auto"), str) and loss_kwargs.get("loss_function", "auto") == "auto":
             loss_kwargs["loss_function"] = self._get_default_loss_function()
@@ -302,7 +303,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         es_wrapper_oof = None
         es_oof_flag = False
         if val_dataset is not None:
-            es_oof_flag = self.params_aux.get("es_oof", False)
+            es_oof_flag = ag_params.get("es_oof", False)
             if epochs_wo_improve is not None:
                 early_stopping_method = SimpleES(patience=epochs_wo_improve)
             else:
@@ -311,7 +312,6 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
             if es_oof_flag:
                 es_wrapper_oof = ESWrapperOOF(es=copy.deepcopy(early_stopping_method), score_func=score_method, best_is_later_if_tie=True)
 
-        ag_params = self._get_ag_params()
         generate_curves = ag_params.get("generate_curves", False)
 
         if generate_curves:
@@ -460,20 +460,19 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
             # validation
             if val_dataset is not None:
                 # FIXME: Fails in rare scenarios where can't calculate metric with n-1 samples (all same class, n=1, etc.)
-                # FIXME: Remove redundant predict call in `self.score`
                 # FIXME: Maybe need to use sample weight to correct for the class that is removed?
                 y_pred_proba_val = self.predict_proba(X=val_dataset, _reset_threads=False)
                 if self.stopping_metric.needs_pred or self.stopping_metric.needs_quantile:
                     y_pred_val = self.predict_from_proba(y_pred_proba_val)
-                    y_pred_val_to_use = y_pred_val
+                    y_score = y_pred_val
                 else:
-                    y_pred_val_to_use = y_pred_proba_val
+                    y_score = y_pred_proba_val
 
                 if early_stop:
                     # compute validation score
-                    val_metric = score_method(y_val, y_pred_val_to_use)
+                    val_metric = score_method(y_val, y_score)
                 else:
-                    es_output = es_wrapper.update(y=y_val, y_score=y_pred_val_to_use, cur_round=epoch - 1)
+                    es_output = es_wrapper.update(y=y_val, y_score=y_score, cur_round=epoch - 1)
                     early_stop = es_output.early_stop
                     val_metric = es_output.score
 
@@ -489,7 +488,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
                     break
 
                 if es_oof_flag:
-                    es_oof_output = es_wrapper_oof.update(y=y_val, y_score=y_pred_val_to_use, cur_round=epoch - 1, y_pred_proba=y_pred_proba_val)
+                    es_oof_output = es_wrapper_oof.update(y=y_val, y_score=y_score, cur_round=epoch - 1, y_pred_proba=y_pred_proba_val)
                     early_stop_oof = es_oof_output.early_stop
                 else:
                     early_stop_oof = True
@@ -940,7 +939,7 @@ class TabularNeuralNetTorchModel(AbstractNeuralNetworkModel):
         return TabularNeuralNetTorchNativeCompiler
 
     def _ag_params(self) -> set:
-        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics"}
+        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics", "es_oof"}
 
     def _get_input_types(self, batch_size=None):
         input_types = []
