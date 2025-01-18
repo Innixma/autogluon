@@ -2310,8 +2310,17 @@ class AbstractTabularTrainer(AbstractTrainer):
                 if model.y_pred_proba_val_oof_ is not None:
                     y_pred_proba_val_oof = model.y_pred_proba_val_oof_
                     score_oof = model.score_with_y_pred_proba(y=y_val, y_pred_proba=y_pred_proba_val_oof, sample_weight=w_val)
-                    print(score, score_oof)
-                    print("yo")
+
+                    # TODO: maybe make this logging work for bagged models too,
+                    #  currently we overwrite their oof instead of keeping track of OG and ES-OOF
+                    logger.log(
+                        20,
+                        f"\tReplacing original validation predictions with ES-OOF variants to reduce overfitting:\n"
+                        f"\t\t{score:.4f}\t = Validation Score (Original)\n"
+                        f"\t\t{score_oof:.4f}\t = Validation Score (ES-OOF)"
+                    )
+
+                    # replace raw validation predictions with non-overfit values
                     y_pred_proba_val = y_pred_proba_val_oof
                     score = score_oof
             elif isinstance(model, BaggedEnsembleModel):
