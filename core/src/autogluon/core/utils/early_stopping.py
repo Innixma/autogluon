@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 from dataclasses import dataclass
 
@@ -145,11 +147,18 @@ class ESOutput:
     score: float
 
 
+@dataclass
+class ESOOFOutput:
+    early_stop: bool
+
+
+# TODO: Should be able to make a really nice unit test of this class
+# TODO: Use error instead of score? Probably better.
 class ESWrapper:
     def __init__(
         self,
         es: AbstractES,
-        score_func,
+        score_func: callable,
         best_is_later_if_tie: bool = True,
     ):
         """
@@ -157,7 +166,7 @@ class ESWrapper:
         Parameters
         ----------
         es: AbstractES
-        score_func
+        score_func: callable
         best_is_later_if_tie : bool, default True
             If True, ties for best will consider the earlier round as best for early stopping, but the later round as best for the value of `self.round_to_use`.
             If False, ties for best will use the earlier round as best for early stopping and for `self.round_to_use`.
@@ -169,8 +178,8 @@ class ESWrapper:
         self.best_score = None
         self.round_to_use = None  # round to use at test time
 
-    def update(self, y: np.ndarray, y_pred_proba: np.ndarray, cur_round: int) -> ESOutput:
-        score = self.score_func(y, y_pred_proba)
+    def update(self, y: np.ndarray, y_score: np.ndarray, cur_round: int) -> ESOutput:
+        score = self.score_func(y, y_score)
         is_best, is_best_or_tie = self._check_is_best(score=score)
         if is_best_or_tie:
             self.round_to_use = cur_round
@@ -201,8 +210,53 @@ class ESWrapper:
         return is_best, is_best_or_tie
 
 
-# TODO: Internally make N ESWrapper clones, where N is len(y).
-# TODO: Keep track of y_pred_proba_oof
-# TODO: Implement ES-OOF for bagging
-class ESWrapperOOF(ESWrapper):
-    pass
+# TODO: Can crash during LOO scoring if roc_auc and all same class
+# TODO: This isn't really OOF, it is LOO.
+# TODO: Should be able to make a really nice unit test of this class
+class ESWrapperOOF:
+    def __init__(
+        self,
+        es: AbstractES,
+        score_func: callable,
+        best_is_later_if_tie: bool = True,
+    ):
+        self._es_template = ESWrapper(es=es, score_func=score_func, best_is_later_if_tie=best_is_later_if_tie)
+        self.y_pred_proba_val_best_oof = None
+        self.len_val = None
+        self.best_val_metric_oof = None
+        self.early_stop_oof = None
+        self.early_stopping_wrapper_val_lst = None
+
+    def _init_wrappers(self, y: np.ndarray, y_pred_proba: np.ndarray):
+        self.y_pred_proba_val_best_oof = copy.deepcopy(y_pred_proba)
+        self.y_pred_proba_shape = y_pred_proba.shape
+        self.len_val = len(y)
+        self.best_val_metric_oof = np.full(self.len_val, -np.inf)  # higher = better
+        self.early_stop_oof = np.zeros(self.len_val, dtype=np.bool_)
+        self.early_stopping_wrapper_val_lst = [copy.deepcopy(self._es_template) for _ in range(self.len_val)]
+
+    # FIXME: docstring
+    # FIXME: y_pred_proba isn't the right name. But what should it be? It is the correct prediction format for stacker inputs.
+    def update(self, y: np.ndarray, y_score: np.ndarray, cur_round: int, y_pred_proba: np.ndarray) -> ESOOFOutput:
+        if self.y_pred_proba_val_best_oof is None:
+            self._init_wrappers(y=y, y_pred_proba=y_pred_proba)
+        early_stop = True
+        for i in range(self.len_val):
+            if not self.early_stop_oof[i]:
+                y_i = np.delete(y, i, axis=0)
+                y_score_i = np.delete(y_score, i, axis=0)
+
+                es_output = self.early_stopping_wrapper_val_lst[i].update(
+                    y=y_i,
+                    y_score=y_score_i,
+                    cur_round=cur_round,
+                )
+
+                self.early_stop_oof[i] = es_output.early_stop
+                if not es_output.early_stop:
+                    early_stop = False
+                # update best validation
+                if es_output.is_best_or_tie:
+                    self.best_val_metric_oof[i] = self.early_stopping_wrapper_val_lst[i].best_score
+                    self.y_pred_proba_val_best_oof[i] = y_pred_proba[i]
+        return ESOOFOutput(early_stop=early_stop)
