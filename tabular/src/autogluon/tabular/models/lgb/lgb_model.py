@@ -117,6 +117,13 @@ class LGBModel(AbstractModel):
         params = self._get_model_params()
         generate_curves = ag_params.get("generate_curves", False)
 
+        if X_val is not None and y_val is not None:
+            es_oof_flag = ag_params.get("es_oof", False)
+            if self.problem_type == QUANTILE and es_oof_flag:
+                raise AssertionError(f"es_oof=True is not implemented for problem_type={QUANTILE}")
+        else:
+            es_oof_flag = False
+
         if generate_curves:
             X_test = kwargs.get("X_test", None)
             y_test = kwargs.get("y_test", None)
@@ -156,7 +163,7 @@ class LGBModel(AbstractModel):
             params["verbose"] = -1
 
         num_rows_train = len(X)
-        dataset_train, dataset_val, dataset_test = self.generate_datasets(
+        dataset_train, dataset_val, dataset_test, X_val_clean, y_val_clean = self.generate_datasets(
             X=X, y=y, params=params, X_val=X_val, y_val=y_val, X_test=X_test, y_test=y_test, sample_weight=sample_weight, sample_weight_val=sample_weight_val
         )
         gc.collect()
@@ -164,8 +171,9 @@ class LGBModel(AbstractModel):
         callbacks = []
         valid_names = []
         valid_sets = []
+        es_custom_callback = None
         if dataset_val is not None:
-            from .callbacks import early_stopping_custom
+            from .callbacks import _EarlyStoppingCustomCallback
 
             # TODO: Better solution: Track trend to early stop when score is far worse than best score, or score is trending worse over time
             early_stopping_rounds = ag_params.get("early_stop", "adaptive")
@@ -184,18 +192,31 @@ class LGBModel(AbstractModel):
             early_stopping_callback_kwargs = dict(
                 stopping_rounds=early_stopping_rounds,
                 metrics_to_use=[("valid_set", stopping_metric_name)],
-                max_diff=None,
                 start_time=start_time,
                 time_limit=time_limit,
                 ignore_dart_warning=True,
                 verbose=False,
-                manual_stop_file=False,
-                reporter=reporter,
                 train_loss_name=train_loss_name,
             )
+
+            if es_oof_flag:
+                extra_es_callback_kwargs = dict(
+                    enable_es_oof=True,
+                    X_val=X_val_clean,
+                    y_val=y_val_clean,
+                    stopping_metric=self.stopping_metric,
+                    problem_type=self.problem_type,
+                )
+            else:
+                extra_es_callback_kwargs = dict()
+
+            early_stopping_callback_kwargs.update(extra_es_callback_kwargs)
+
+            es_custom_callback = _EarlyStoppingCustomCallback(**early_stopping_callback_kwargs)
+
             callbacks += [
                 # Note: Don't use self.params_aux['max_memory_usage_ratio'] here as LightGBM handles memory per iteration optimally.  # TODO: Consider using when ratio < 1.
-                early_stopping_custom(**early_stopping_callback_kwargs)
+                es_custom_callback,
             ]
             valid_names = ["valid_set"] + valid_names
             valid_sets = [dataset_val] + valid_sets
@@ -285,6 +306,7 @@ class LGBModel(AbstractModel):
                 if train_params["params"].get("device", "cpu") != "gpu":
                     raise
                 else:
+                    # FIXME: Is early stopping callback state bugged if exception occurs after it was initialized?
                     logger.warning(
                         "Warning: GPU mode might not be installed for LightGBM, GPU training raised an exception. Falling back to CPU training..."
                         "Refer to LightGBM GPU documentation: https://github.com/Microsoft/LightGBM/tree/master/python-package#build-gpu-version"
@@ -294,6 +316,11 @@ class LGBModel(AbstractModel):
                     )
                     train_params["params"]["device"] = "cpu"
                     self.model = train_lgb_model(early_stopping_callback_kwargs=early_stopping_callback_kwargs, **train_params)
+
+            if es_oof_flag:
+                if es_custom_callback is not None:
+                    self.y_pred_proba_val_oof_ = es_custom_callback.get_y_pred_val_oof()
+
             retrain = False
             if train_params["params"].get("boosting_type", "") == "dart":
                 if dataset_val is not None and dart_retrain and (self.model.best_iteration != num_boost_round):
@@ -468,7 +495,9 @@ class LGBModel(AbstractModel):
                 dataset_val.softlabels = y_val_og
             if y_test_og is not None:
                 dataset_test.softlabels = y_test_og
-        return dataset_train, dataset_val, dataset_test
+        if y_val is not None:
+            y_val = y_val.to_numpy()
+        return dataset_train, dataset_val, dataset_test, X_val, y_val
 
     def _get_train_loss_name(self):
         if self.problem_type == BINARY:
@@ -526,7 +555,7 @@ class LGBModel(AbstractModel):
         return self._features_internal_list
 
     def _ag_params(self) -> set:
-        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics"}
+        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics", "es_oof"}
 
     @classmethod
     def _class_tags(cls):

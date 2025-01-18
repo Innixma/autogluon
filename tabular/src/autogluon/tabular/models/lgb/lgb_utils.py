@@ -156,7 +156,7 @@ class QuantileBooster:
     def fit(self, **train_params_base):
         import lightgbm as lgb
 
-        from .callbacks import early_stopping_custom
+        from .callbacks import _EarlyStoppingCustomCallback
 
         start_time_global = time.time()
 
@@ -169,7 +169,8 @@ class QuantileBooster:
                     es_kwargs["start_time"] = time.time()
                     es_kwargs["time_limit"] = self.time_limit_global / len(self.quantile_levels)
                 # Don't add a logging callback to avoid printing logs for each base booster
-                train_params["callbacks"] = [early_stopping_custom(**es_kwargs)]
+                es_callback = _EarlyStoppingCustomCallback(**es_kwargs)
+                train_params["callbacks"] = [es_callback]
             else:
                 train_params["callbacks"] = []
 
