@@ -791,12 +791,13 @@ class BaggedEnsembleModel(AbstractModel):
             self.add_child(model=model_name, add_child_times=False, add_child_resources=False)
         self._bagged_mode = True
 
+        # TODO: Bagging/CV for Weighted Ensemble? Maybe good for picking between L2 and L3 WE???
         if self._oof_pred_proba is None:
-            self._oof_pred_proba = oof_pred_proba
-            self._oof_pred_model_repeats = oof_pred_model_repeats
+            self._oof_pred_proba = fold_fitting_strategy.oof_pred_proba
+            self._oof_pred_model_repeats = fold_fitting_strategy.oof_pred_model_repeats
         else:
-            self._oof_pred_proba += oof_pred_proba
-            self._oof_pred_model_repeats += oof_pred_model_repeats
+            self._oof_pred_proba += fold_fitting_strategy.oof_pred_proba
+            self._oof_pred_model_repeats += fold_fitting_strategy.oof_pred_model_repeats
 
         self._cv_splitters += [cv_splitter for _ in range(n_repeats_started)]
         self._k_per_n_repeat += [k_fold for _ in range(n_repeats_finished)]

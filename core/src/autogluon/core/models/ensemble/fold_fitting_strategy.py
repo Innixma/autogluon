@@ -276,6 +276,10 @@ class FoldFittingStrategy(AbstractFoldFittingStrategy):
                 if expected_remaining_time_required > time_left:
                     raise TimeLimitExceeded
         y_pred_proba = fold_model.predict_proba(X_val_fold, record_time=True)
+        # FIXME: Maybe avoid predicting above if this is present? But then we won't be able to record the time
+        # FIXME: Why two different predict_oof functions for parallel and sequential? Should ideally be 1
+        if fold_model.y_pred_proba_val_oof_ is not None:
+            y_pred_proba = fold_model.y_pred_proba_val_oof_
         fold_model.val_score = fold_model.score_with_y_pred_proba(y=y_val_fold, y_pred_proba=y_pred_proba)
         fold_model.reduce_memory_size(remove_fit=True, remove_info=False, requires_save=True)
         if not self.bagged_ensemble_model.params.get("save_bag_folds", True):
@@ -430,6 +434,10 @@ def _ray_fit(
 
 def _ray_predict_oof(fold_model: AbstractModel, X_val_fold: pd.DataFrame, y_val_fold: pd.Series, num_cpus: int = -1, save_bag_folds: bool = True) -> tuple[AbstractModel, ndarray]:
     y_pred_proba = fold_model.predict_proba(X_val_fold, record_time=True, num_cpus=num_cpus)
+    # FIXME: Maybe avoid predicting above if this is present? But then we won't be able to record the time
+    # FIXME: Why two different predict_oof functions for parallel and sequential? Should ideally be 1
+    if fold_model.y_pred_proba_val_oof_ is not None:
+        y_pred_proba = fold_model.y_pred_proba_val_oof_
     fold_model.val_score = fold_model.score_with_y_pred_proba(y=y_val_fold, y_pred_proba=y_pred_proba)
     fold_model.reduce_memory_size(remove_fit=True, remove_info=False, requires_save=True)
     if not save_bag_folds:
