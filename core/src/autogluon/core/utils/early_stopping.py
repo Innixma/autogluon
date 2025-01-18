@@ -221,6 +221,7 @@ class ESWrapperOOF:
         best_is_later_if_tie: bool = True,
     ):
         self._es_template = ESWrapper(es=es, score_func=score_func, best_is_later_if_tie=best_is_later_if_tie)
+        self.score_func = score_func
         self.y_pred_proba_val_best_oof = None
         self.len_val = None
         self.best_val_metric_oof = None
