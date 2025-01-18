@@ -10,9 +10,10 @@ from autogluon.common.features.types import R_BOOL, R_CATEGORY, R_FLOAT, R_INT
 from autogluon.common.utils.pandas_utils import get_approximate_df_mem_usage
 from autogluon.common.utils.resource_utils import ResourceManager
 from autogluon.common.utils.try_import import try_import_catboost
-from autogluon.core.constants import MULTICLASS, PROBLEM_TYPES_CLASSIFICATION, QUANTILE, SOFTCLASS
+from autogluon.core.constants import BINARY, MULTICLASS, PROBLEM_TYPES_CLASSIFICATION, QUANTILE, SOFTCLASS
 from autogluon.core.models import AbstractModel
 from autogluon.core.models._utils import get_early_stopping_rounds
+from autogluon.core.utils.early_stopping import ESWrapperOOF
 from autogluon.core.utils.exceptions import TimeLimitExceeded
 
 from .callbacks import EarlyStoppingCallback, MemoryCheckCallback, TimeCheckCallback
@@ -118,6 +119,13 @@ class CatBoostModel(AbstractModel):
         elif self.problem_type == QUANTILE:
             # FIXME: Unless specified, CatBoost defaults to loss_function='MultiQuantile' and raises an exception
             params["loss_function"] = params["eval_metric"]
+
+        if X_val is not None and y_val is not None:
+            es_oof_flag = ag_params.get("es_oof", False)
+            if self.problem_type == QUANTILE and es_oof_flag:
+                raise AssertionError(f"es_oof=True is not implemented for problem_type={QUANTILE}")
+        else:
+            es_oof_flag = False
 
         model_type = CatBoostClassifier if self.problem_type in PROBLEM_TYPES_CLASSIFICATION else CatBoostRegressor
         num_rows_train = len(X)
@@ -238,11 +246,45 @@ class CatBoostModel(AbstractModel):
         )
 
         if eval_set is not None:
-            fit_final_kwargs["use_best_model"] = True
+            fit_final_kwargs["use_best_model"] = not es_oof_flag
 
         self.model.fit(X, **fit_final_kwargs)
 
+        if es_oof_flag:
+            self.y_pred_proba_val_oof_ = self._reconstruct_es_oof(X_val=X_val, y_val=y_val, early_stopping_rounds=early_stopping_rounds)
+
+            optimal_ntree = self.model.best_iteration_ + 1
+            if self.model.tree_count_ != optimal_ntree:
+                self.model.shrink(optimal_ntree)
+
         self.params_trained["iterations"] = self.model.tree_count_
+
+    # FIXME: https://github.com/catboost/catboost/issues/2802
+    # FIXME: `es` should use same logic as callback
+    def _reconstruct_es_oof(self, X_val, y_val, early_stopping_rounds):
+        if self.problem_type in [BINARY, MULTICLASS, SOFTCLASS]:
+            staged_predictions = self.model.staged_predict_proba(X_val)
+        else:
+            staged_predictions = self.model.staged_predict(X_val)
+
+        es = early_stopping_rounds[0](**early_stopping_rounds[1])
+        es_wrapper_oof = ESWrapperOOF(es=es, score_func=self.stopping_metric, best_is_later_if_tie=False)
+
+        y_val = y_val.to_numpy()
+        # FIXME: This is imperfect, as it doesn't include iterations that would have still been running without early stopping for LOO.
+        #  Unfortunately, because we can't construct this in the callback during fit, this is the best we can do without fitting extra iterations
+        for i, y_pred_proba in enumerate(staged_predictions):
+            y_pred_proba = self._convert_proba_to_unified_form(y_pred_proba)
+            if es_wrapper_oof.score_func.needs_pred or es_wrapper_oof.score_func.needs_quantile:
+                y_score = self.predict_from_proba(y_pred_proba)
+            else:
+                y_score = y_pred_proba
+
+            es_wrapper_oof.update(y=y_val, y_score=y_score, cur_round=i, y_pred_proba=y_pred_proba)
+
+        y_pred_proba_val_best_oof = es_wrapper_oof.y_pred_proba_val_best_oof
+
+        return y_pred_proba_val_best_oof
 
     # FIXME: This logic is a hack made to maintain compatibility with GPU CatBoost.
     #  GPU CatBoost does not support callbacks or custom metrics.
@@ -315,7 +357,7 @@ class CatBoostModel(AbstractModel):
         return get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=strategy)
 
     def _ag_params(self) -> set:
-        return {"early_stop"}
+        return {"early_stop", "es_oof"}
 
     def _validate_fit_memory_usage(self, mem_error_threshold: float = 1, mem_warning_threshold: float = 0.75, mem_size_threshold: int = 1e9, **kwargs):
         return super()._validate_fit_memory_usage(
