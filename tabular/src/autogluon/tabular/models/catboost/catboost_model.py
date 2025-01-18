@@ -261,7 +261,7 @@ class CatBoostModel(AbstractModel):
 
     # FIXME: https://github.com/catboost/catboost/issues/2802
     # FIXME: `es` should use same logic as callback
-    def _reconstruct_es_oof(self, X_val, y_val, early_stopping_rounds):
+    def _reconstruct_es_oof(self, X_val, y_val: pd.Series, early_stopping_rounds: tuple) -> np.ndarray:
         if self.problem_type in [BINARY, MULTICLASS, SOFTCLASS]:
             staged_predictions = self.model.staged_predict_proba(X_val)
         else:
