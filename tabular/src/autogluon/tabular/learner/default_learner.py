@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # TODO: Add cv / OOF generator option, so that AutoGluon can be used as a base model in an ensemble stacker
 # Learner encompasses full problem, loading initial data, feature generation, model training, model prediction
 class DefaultLearner(AbstractTabularLearner):
-    def __init__(self, trainer_type=AutoTrainer, **kwargs):
+    def __init__(self, trainer_type=AutoTrainer, fit_transform_val=True, fit_transform_test=False, fit_transform_unlabeled=True, **kwargs):
         super().__init__(**kwargs)
         self.trainer_type = trainer_type
         self.class_weights = None
@@ -38,6 +38,13 @@ class DefaultLearner(AbstractTabularLearner):
         self._time_limit = None
         self.preprocess_1_time = None  # Time required to preprocess 1 row of data
         self.preprocess_1_batch_size = None  # Batch size used to calculate self.preprocess_1_time
+        # FIXME: Even if self._fit_transform_val is False, it won't fix if tuning_data isn't specified (split happens after transform)
+        #  Need to update code so the split happens before preprocessing occurs
+        #  Also won't help with bagging, because the fold splits don't also do preprocessing
+        #  Would need to do preprocessing inside the fold splits
+        self._fit_transform_val = fit_transform_val  # FIXME: Should probably default to False. Historically it has been set to True.
+        self._fit_transform_test = fit_transform_test
+        self._fit_transform_unlabeled = fit_transform_unlabeled
 
     # TODO: v0.1 Document trainer_fit_kwargs
     def _fit(
@@ -194,6 +201,8 @@ class DefaultLearner(AbstractTabularLearner):
             infer_limit = infer_limit_new
         return infer_limit
 
+    # FIXME: Move train/val split logic to BEFORE this logic. Otherwise the leak still occurs
+    # TODO: Try enabling for bag folds by skipping this and doing the feature generator fit for every model
     # TODO: Add default values to X_val, X_unlabeled, holdout_frac, and num_bag_folds
     def general_data_processing(
         self, X: DataFrame, X_val: DataFrame = None, X_test: DataFrame = None, X_unlabeled: DataFrame = None, holdout_frac: float = 1, num_bag_folds: int = 0
@@ -253,47 +262,65 @@ class DefaultLearner(AbstractTabularLearner):
                 "Performing general data preprocessing with merged train & validation data, so validation/test performance may not accurately reflect performance on new test data",
             )
 
-        # TODO: extend this boolean flag into learner init parameter
-        transform_with_test = False
-
-        X_test_super = None
-        y_test_super = None
-        if transform_with_test:
-            X_test_super = X_test
-            y_test_super = y_test
-
-        datasets = [X, X_val, X_test_super, X_unlabeled]
-        X_super = pd.concat(datasets, ignore_index=True)
-
         if self.feature_generator.is_fit():
             logger.log(
                 20,
                 f"{self.feature_generator.__class__.__name__} is already fit, so the training data will be processed via .transform() instead of .fit_transform().",
             )
-            X_super = self.feature_generator.transform(X_super)
-            if not transform_with_test and X_test is not None:
+            X = self.feature_generator.transform(X)
+            if X_val is not None:
+                X_val = self.feature_generator.transform(X_val)
+            if X_test is not None:
                 X_test = self.feature_generator.transform(X_test)
             self.feature_generator.print_feature_metadata_info()
         else:
-            y_unlabeled = pd.Series(np.nan, index=X_unlabeled.index) if X_unlabeled is not None else None
-            y_list = [y, y_val, y_test_super, y_unlabeled]
+            X_test_super = None
+            y_test_super = None
+            if self._fit_transform_test:
+                X_test_super = X_test
+                y_test_super = y_test
+            X_val_super = None
+            y_val_super = None
+            if self._fit_transform_val:
+                X_val_super = X_val
+                y_val_super = y_val
+            X_unlabeled_super = None
+            y_unlabeled_super = None
+            if self._fit_transform_unlabeled:
+                X_unlabeled_super = X_unlabeled
+                y_unlabeled_super = pd.Series(np.nan, index=X_unlabeled_super.index) if X_unlabeled_super is not None else None
+
+            datasets = [X, X_val_super, X_test_super, X_unlabeled_super]
+            X_super = pd.concat(datasets, ignore_index=True)
+
+            y_list = [y, y_val_super, y_test_super, y_unlabeled_super]
             y_super = pd.concat(y_list, ignore_index=True)
             X_super = self.fit_transform_features(X_super, y_super, problem_type=self.label_cleaner.problem_type_transform, eval_metric=self.eval_metric)
-            if not transform_with_test and X_test is not None:
+
+            idx = 0
+            for i in range(len(datasets)):
+                if datasets[i] is not None:
+                    length = len(datasets[i])
+                    datasets[i] = X_super.iloc[idx : idx + length].set_index(datasets[i].index)
+                    idx += length
+
+            X, X_val_super, X_test_super, X_unlabeled_super = datasets
+            del X_super
+
+            if self._fit_transform_val:
+                X_val = X_val_super
+            elif X_val is not None:
+                X_val = self.feature_generator.transform(X_val)
+
+            if self._fit_transform_test:
+                X_test = X_test_super
+            elif X_test is not None:
                 X_test = self.feature_generator.transform(X_test)
 
-        idx = 0
-        for i in range(len(datasets)):
-            if datasets[i] is not None:
-                length = len(datasets[i])
-                datasets[i] = X_super.iloc[idx : idx + length].set_index(datasets[i].index)
-                idx += length
-
-        X, X_val, X_test_super, X_unlabeled = datasets
-        del X_super
-
-        if transform_with_test:
-            X_test = X_test_super
+            if self._fit_transform_unlabeled:
+                X_unlabeled = X_unlabeled_super
+            elif X_unlabeled is not None:
+                X_unlabeled = self.feature_generator.transform(X_unlabeled)
 
         # TODO: consider not bundling sample-weights inside X, X_val
         X = self.bundle_weights(X, w, "X", is_train=True)
