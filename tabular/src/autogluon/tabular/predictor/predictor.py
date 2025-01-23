@@ -4303,6 +4303,44 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             dry_run=dry_run,
         )
 
+    def delete_from_disk(self, verbose: bool = True, dry_run: bool = True):
+        """
+        Deletes the predictor from disk, including all model artifacts.
+        Equivalent to the terminal command `rm -rf {predictor_directory}`
+
+        WARNING: This will DELETE ALL FILES in the self.path directory, regardless if they were created by AutoGluon or not.
+        DO NOT STORE FILES INSIDE THE PREDICTOR DIRECTORY THAT ARE UNRELATED TO AUTOGLUON.
+
+        WARNING: After calling this method, all future calls to the predictor object will raise an exception if it tries to access any of the deleted files.
+        """
+        if dry_run:
+            disk_usage_per_file = self.disk_usage_per_file()
+
+            logger.log(30, f'Dry run enabled, AutoGluon would have deleted all predictor files under: "{self.path}"')
+            logger.log(30, f"List of all files to be deleted (and size in bytes):\n")
+            with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 1000):
+                logger.log(30, disk_usage_per_file)
+            logger.log(30, f"\nTo perform the deletion, call `predictor.delete_from_disk(dry_run=False)")
+            return
+        if verbose:
+            disk_usage_per_file = self.disk_usage_per_file()
+            logger.log(30, f'Deleting predictor. All files under {self.path} will be removed.')
+            logger.log(30, f"List of all files to be deleted (and size in bytes):\n")
+            with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 1000):
+                logger.log(30, disk_usage_per_file)
+        import shutil
+        from pathlib import Path
+
+        predictor_path = Path(self.path)
+        # TODO: Report errors?
+        shutil.rmtree(path=predictor_path, ignore_errors=True)
+        if verbose:
+            logger.log(
+                30,
+                f"\nDeleted all predictor artifacts from disk. All future calls to this predictor object will likely fail. "
+                f"Please create a new predictor object to continue using AutoGluon."
+            )
+
     def disk_usage(self) -> int:
         """
         Returns the combined size of all files under the `predictor.path` directory in bytes.
