@@ -234,7 +234,11 @@ class ESWrapperOOF:
         self.len_val = len(y)
         self.best_val_metric_oof = np.full(self.len_val, -np.inf)  # higher = better
         self.early_stop_oof = np.zeros(self.len_val, dtype=np.bool_)
-        self.early_stopping_wrapper_val_lst = [copy.deepcopy(self._es_template) for _ in range(self.len_val)]
+        self.early_stopping_wrapper_val_lst: list[ESWrapper] = [copy.deepcopy(self._es_template) for _ in range(self.len_val)]
+
+    @property
+    def round_to_use(self) -> np.ndarray:
+        return np.array([es.round_to_use for es in self.early_stopping_wrapper_val_lst])
 
     # FIXME: docstring
     # FIXME: y_pred_proba isn't the right name. But what should it be? It is the correct prediction format for stacker inputs.
