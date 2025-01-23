@@ -267,7 +267,12 @@ class CatBoostModel(AbstractModel):
         else:
             staged_predictions = self.model.staged_predict(X_val)
 
-        es = early_stopping_rounds[0](**early_stopping_rounds[1])
+        if isinstance(early_stopping_rounds, int):
+            from autogluon.core.utils.early_stopping import SimpleES
+            es = SimpleES(patience=early_stopping_rounds)
+        else:
+            es = early_stopping_rounds[0](**early_stopping_rounds[1])
+
         es_wrapper_oof = ESWrapperOOF(es=es, score_func=self.stopping_metric, best_is_later_if_tie=False)
 
         y_val = y_val.to_numpy()
