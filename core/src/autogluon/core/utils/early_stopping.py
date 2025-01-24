@@ -167,7 +167,7 @@ class ESWrapper:
         Parameters
         ----------
         es: AbstractES
-        score_func: callable
+        score_func: Callable
         best_is_later_if_tie : bool, default True
             If True, ties for best will consider the earlier round as best for early stopping, but the later round as best for the value of `self.round_to_use`.
             If False, ties for best will use the earlier round as best for early stopping and for `self.round_to_use`.
