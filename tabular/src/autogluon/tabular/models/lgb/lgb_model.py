@@ -30,7 +30,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, message="Dask datafram
 logger = logging.getLogger(__name__)
 
 
-# TODO: Save dataset to binary and reload for HPO. This will avoid the memory spike overhead when training each model and instead it will only occur once upon saving the dataset.
 class LGBModel(AbstractModel):
     """
     LightGBM model: https://lightgbm.readthedocs.io/en/latest/
@@ -171,33 +170,29 @@ class LGBModel(AbstractModel):
         callbacks = []
         valid_names = []
         valid_sets = []
-        es_custom_callback = None
-        if dataset_val is not None:
-            from .callbacks import _EarlyStoppingCustomCallback
 
-            # TODO: Better solution: Track trend to early stop when score is far worse than best score, or score is trending worse over time
+        if dataset_val is not None:
             early_stopping_rounds = ag_params.get("early_stop", "adaptive")
             if isinstance(early_stopping_rounds, (str, tuple, list)):
                 early_stopping_rounds = self._get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=early_stopping_rounds)
             if early_stopping_rounds is None:
                 early_stopping_rounds = 999999
-            reporter = kwargs.get("reporter", None)
-            train_loss_name = self._get_train_loss_name() if reporter is not None else None
-            if train_loss_name is not None:
-                if "metric" not in params or params["metric"] == "":
-                    params["metric"] = train_loss_name
-                elif train_loss_name not in params["metric"]:
-                    params["metric"] = f'{params["metric"]},{train_loss_name}'
+            metrics_to_use = [("valid_set", stopping_metric_name)],
+        else:
+            early_stopping_rounds = None
+            metrics_to_use = None
+
+        early_stopping_callback_kwargs = dict(
+            stopping_rounds=early_stopping_rounds,
+            metrics_to_use=metrics_to_use,
+            start_time=start_time,
+            time_limit=time_limit,
+            ignore_dart_warning=True,
+            verbose=False,
+        )
+
+        if dataset_val is not None:
             # early stopping callback will be added later by QuantileBooster if problem_type==QUANTILE
-            early_stopping_callback_kwargs = dict(
-                stopping_rounds=early_stopping_rounds,
-                metrics_to_use=[("valid_set", stopping_metric_name)],
-                start_time=start_time,
-                time_limit=time_limit,
-                ignore_dart_warning=True,
-                verbose=False,
-                train_loss_name=train_loss_name,
-            )
 
             if es_oof_flag:
                 extra_es_callback_kwargs = dict(
@@ -212,16 +207,16 @@ class LGBModel(AbstractModel):
 
             early_stopping_callback_kwargs.update(extra_es_callback_kwargs)
 
-            es_custom_callback = _EarlyStoppingCustomCallback(**early_stopping_callback_kwargs)
-
-            callbacks += [
-                # Note: Don't use self.params_aux['max_memory_usage_ratio'] here as LightGBM handles memory per iteration optimally.  # TODO: Consider using when ratio < 1.
-                es_custom_callback,
-            ]
             valid_names = ["valid_set"] + valid_names
             valid_sets = [dataset_val] + valid_sets
-        else:
-            early_stopping_callback_kwargs = None
+
+        from .callbacks import _EarlyStoppingCustomCallback
+        es_custom_callback = _EarlyStoppingCustomCallback(**early_stopping_callback_kwargs)
+
+        callbacks += [
+            # Note: Don't use self.params_aux['max_memory_usage_ratio'] here as LightGBM handles memory per iteration optimally.  # TODO: Consider using when ratio < 1.
+            es_custom_callback,
+        ]
 
         from lightgbm.callback import log_evaluation, record_evaluation
 
@@ -239,37 +234,16 @@ class LGBModel(AbstractModel):
             "keep_training_booster": generate_curves,
         }
 
+        metric_names = None
+        eval_results = None
         if generate_curves:
-            scorers = ag_params.get("curve_metrics", [self.eval_metric])
-            use_curve_metric_error = ag_params.get("use_error_for_curve_metrics", False)
-            metric_names = [scorer.name for scorer in scorers]
-
-            if stopping_metric_name in metric_names:
-                idx = metric_names.index(stopping_metric_name)
-                scorers[idx].name = f"_{stopping_metric_name}"
-                metric_names[idx] = scorers[idx].name
-
-            custom_metrics = [
-                lgb_utils.func_generator(
-                    metric=scorer,
-                    is_higher_better=scorer.greater_is_better_internal,
-                    needs_pred_proba=not scorer.needs_pred,
-                    problem_type=self.problem_type,
-                    error=use_curve_metric_error,
-                )
-                for scorer in scorers
-            ]
-
-            eval_results = {}
-            train_params["callbacks"].append(record_evaluation(eval_results))
-            train_params["feval"] = custom_metrics
-
-            if dataset_test is not None:
-                train_params["valid_names"] = ["train_set", "test_set"] + train_params["valid_names"]
-                train_params["valid_sets"] = [dataset_train, dataset_test] + train_params["valid_sets"]
-            else:
-                train_params["valid_names"] = ["train_set"] + train_params["valid_names"]
-                train_params["valid_sets"] = [dataset_train] + train_params["valid_sets"]
+            train_params, metric_names, eval_results = self._prepare_learning_curves(
+                ag_params=ag_params,
+                stopping_metric_name=stopping_metric_name,
+                train_params=train_params,
+                dataset_train=dataset_train,
+                dataset_test=dataset_test,
+            )
 
         # NOTE: lgb stops based on first metric if more than one
         if not isinstance(stopping_metric, str):
@@ -340,25 +314,13 @@ class LGBModel(AbstractModel):
                         logger.log(15, f"Not enough time to retrain LGB model ('dart' mode)...")
 
         if generate_curves:
-
-            def og_name(key):
-                if key == f"_{stopping_metric_name}":
-                    return stopping_metric_name
-                return key
-
-            def filter(d, keys):
-                return {og_name(key): d[key] for key in keys if key in d}
-
-            curves = {"train": filter(eval_results["train_set"], metric_names)}
-            if X_val is not None:
-                curves["val"] = filter(eval_results["valid_set"], metric_names)
-            if X_test is not None:
-                curves["test"] = filter(eval_results["test_set"], metric_names)
-
-            if f"_{stopping_metric_name}" in metric_names:
-                idx = metric_names.index(f"_{stopping_metric_name}")
-                metric_names[idx] = stopping_metric_name
-
+            metric_names, curves = self._process_learning_curves(
+                stopping_metric_name=stopping_metric_name,
+                eval_results=eval_results,
+                metric_names=metric_names,
+                X_val=X_val,
+                X_test=X_test,
+            )
             self.save_learning_curves(metrics=metric_names, curves=curves)
 
         if dataset_val is not None and not retrain:
@@ -499,17 +461,6 @@ class LGBModel(AbstractModel):
             y_val = y_val.to_numpy()
         return dataset_train, dataset_val, dataset_test, X_val, y_val
 
-    def _get_train_loss_name(self):
-        if self.problem_type == BINARY:
-            train_loss_name = "binary_logloss"
-        elif self.problem_type == MULTICLASS:
-            train_loss_name = "multi_logloss"
-        elif self.problem_type == REGRESSION:
-            train_loss_name = "l2"
-        else:
-            raise ValueError(f"unknown problem_type for LGBModel: {self.problem_type}")
-        return train_loss_name
-
     def _get_early_stopping_rounds(self, num_rows_train, strategy="auto"):
         return get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=strategy)
 
@@ -535,6 +486,70 @@ class LGBModel(AbstractModel):
             return True
         except Exception as e:
             return False
+
+    def _prepare_learning_curves(
+        self,
+        ag_params: dict,
+        stopping_metric_name: str,
+        train_params: dict,
+        dataset_train,
+        dataset_test=None,
+    ) -> tuple[dict, list, dict]:
+        from lightgbm.callback import record_evaluation
+
+        scorers = ag_params.get("curve_metrics", [self.eval_metric])
+        use_curve_metric_error = ag_params.get("use_error_for_curve_metrics", False)
+        metric_names = [scorer.name for scorer in scorers]
+
+        if stopping_metric_name in metric_names:
+            idx = metric_names.index(stopping_metric_name)
+            scorers[idx].name = f"_{stopping_metric_name}"
+            metric_names[idx] = scorers[idx].name
+
+        custom_metrics = [
+            lgb_utils.func_generator(
+                metric=scorer,
+                is_higher_better=scorer.greater_is_better_internal,
+                needs_pred_proba=not scorer.needs_pred,
+                problem_type=self.problem_type,
+                error=use_curve_metric_error,
+            )
+            for scorer in scorers
+        ]
+
+        eval_results = {}
+        train_params["callbacks"].append(record_evaluation(eval_results))
+        train_params["feval"] = custom_metrics
+
+        if dataset_test is not None:
+            train_params["valid_names"] = ["train_set", "test_set"] + train_params["valid_names"]
+            train_params["valid_sets"] = [dataset_train, dataset_test] + train_params["valid_sets"]
+        else:
+            train_params["valid_names"] = ["train_set"] + train_params["valid_names"]
+            train_params["valid_sets"] = [dataset_train] + train_params["valid_sets"]
+
+        return train_params, metric_names, eval_results
+
+    def _process_learning_curves(self, stopping_metric_name, eval_results, metric_names, X_val=None, X_test=None):
+        def og_name(key):
+            if key == f"_{stopping_metric_name}":
+                return stopping_metric_name
+            return key
+
+        def filter(d, keys):
+            return {og_name(key): d[key] for key in keys if key in d}
+
+        curves = {"train": filter(eval_results["train_set"], metric_names)}
+        if X_val is not None:
+            curves["val"] = filter(eval_results["valid_set"], metric_names)
+        if X_test is not None:
+            curves["test"] = filter(eval_results["test_set"], metric_names)
+
+        if f"_{stopping_metric_name}" in metric_names:
+            idx = metric_names.index(f"_{stopping_metric_name}")
+            metric_names[idx] = stopping_metric_name
+
+        return metric_names, curves
 
     def get_minimum_resources(self, is_gpu_available=False):
         minimum_resources = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Callable
 
 import numpy as np
 from dataclasses import dataclass
@@ -158,7 +159,7 @@ class ESWrapper:
     def __init__(
         self,
         es: AbstractES,
-        score_func: callable,
+        score_func: Callable,
         best_is_later_if_tie: bool = True,
     ):
         """
@@ -213,11 +214,12 @@ class ESWrapper:
 # TODO: Can crash during LOO scoring if roc_auc and all same class
 # TODO: This isn't really OOF, it is LOO.
 # TODO: Should be able to make a really nice unit test of this class
+# TODO: Calculate the average score_test of the iterations used for calculating ES-OOF-val, aka the quality of the theoretical model that produced oof-val
 class ESWrapperOOF:
     def __init__(
         self,
         es: AbstractES,
-        score_func: callable,
+        score_func: Callable,
         best_is_later_if_tie: bool = True,
     ):
         self._es_template = ESWrapper(es=es, score_func=score_func, best_is_later_if_tie=best_is_later_if_tie)
