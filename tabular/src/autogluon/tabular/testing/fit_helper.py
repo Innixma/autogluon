@@ -569,6 +569,60 @@ class FitHelper:
                         **kwargs,
                     )
 
+    @staticmethod
+    def models_checklist(model_register):
+        df_lst = []
+        for model_cls in model_register.model_cls_list:
+            df_lst.append(FitHelper.model_checklist(model_cls=model_cls))
+        df = pd.concat(df_lst, axis=1).T
+        print(df)
+        markdown = df.to_markdown(index=False)
+        print(markdown)
+
+    @staticmethod
+    def model_checklist(model_cls: Type[AbstractModel]):
+        supported_problem_types = model_cls.supported_problem_types()
+        assert supported_problem_types is not None, f"No supported_problem_types specified!"
+
+        from autogluon.tabular.registry import ModelRegistry
+
+        model_register = ModelRegistry(model_cls_list=[model_cls])
+        df = model_register.to_frame().reset_index(drop=False)
+        series = df.iloc[0]
+
+        extra_info_dict = {}
+
+        problem_types = ["binary", "multiclass", "regression", "quantile", "softclass"]
+
+        problem_type_dict = {problem_type: problem_type in supported_problem_types for problem_type in problem_types}
+        tags = model_cls._get_class_tags()
+        compilers = model_cls._valid_compilers()
+        can_compile = len(compilers) != 0
+        extra_info_dict.update(problem_type_dict)
+        extra_info_dict.update(tags)
+        extra_info_dict["can_compile"] = can_compile
+
+        # TODO: Can control CPU usage
+        # TODO: GPU support
+        # TODO: "can_use_val_data"
+        # TODO: sample_weights
+        # TODO: unlabeled data
+        # TODO: time_limit
+        # TODO: refit_full
+        # TODO: missing value handling (native vs custom)
+        # TODO: Feature type support
+        #  image
+        #  text
+        #  category
+        # TODO: child_oof
+        # TODO: from __future__ import annotations called
+        # TODO: random seed not altered (np.seed and random.seed) -> LightGBM
+
+        series_2 = pd.concat([series, pd.Series(extra_info_dict)])
+        df = series_2.to_frame(series_2["ag_key"])
+
+        return df
+
 
 def stacked_overfitting_assert(
     lb: pd.DataFrame,
